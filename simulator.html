@@ -1,0 +1,842 @@
+<title>Valorant Bet Simulator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: three-pane console. Setup (host profile + game controls) | bot channel | live book (bet buttons, pools, balances) */
+:root {
+  --bg: #ECE8E1; --surface: #F7F5F1; --raised: #FFFFFF; --ink: #0F1923; --muted: #5B6670; --line: #D6D0C6;
+  --accent: #D92D3E; --accent-ink: #FFFFFF; --accent-soft: #F8DADD;
+  --win: #18865A; --win-soft: #DDF1E7; --loss: #C9293A; --loss-soft: #F8DDE0; --push: #6E7A86; --gold: #A67A08; --info: #2E6FB0;
+  --chat: #F3F0EB; --embed: #FFFFFF; --hover: rgba(15,25,35,.04);
+  --av1: #D92D3E; --av2: #2E6FB0; --av3: #18865A; --av4: #8A5CC2; --av5: #C27A12;
+  --display: "Chakra Petch", "Segoe UI", system-ui, sans-serif;
+  --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #0F1923; --surface: #15212C; --raised: #1C2A37; --ink: #ECE8E1; --muted: #8E9BA7; --line: #283745;
+  --accent: #FF4655; --accent-ink: #0F1923; --accent-soft: #3A1F28;
+  --win: #3DD68C; --win-soft: #16352A; --loss: #FF6B78; --loss-soft: #3A1F28; --push: #8E9BA7; --gold: #F2C14E; --info: #6AAEF0;
+  --chat: #121D27; --embed: #1A2733; --hover: rgba(236,232,225,.04);
+  --av1: #FF4655; --av2: #4E95DB; --av3: #2FB87A; --av4: #A47BE0; --av5: #E2A23B;
+  color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #0F1923; --surface: #15212C; --raised: #1C2A37; --ink: #ECE8E1; --muted: #8E9BA7; --line: #283745;
+  --accent: #FF4655; --accent-ink: #0F1923; --accent-soft: #3A1F28;
+  --win: #3DD68C; --win-soft: #16352A; --loss: #FF6B78; --loss-soft: #3A1F28; --push: #8E9BA7; --gold: #F2C14E; --info: #6AAEF0;
+  --chat: #121D27; --embed: #1A2733; --hover: rgba(236,232,225,.04);
+  --av1: #FF4655; --av2: #4E95DB; --av3: #2FB87A; --av4: #A47BE0; --av5: #E2A23B;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--body); }
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.top { max-width: 1500px; margin: 0 auto; padding-inline: 16px; padding-block: 18px 6px;
+  display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: end; justify-content: space-between; }
+.top h1 { margin: 0; font: 700 26px/1.1 var(--display); letter-spacing: .02em; text-transform: uppercase; text-wrap: balance; }
+.top h1 span { color: var(--accent); }
+.top p { margin: 4px 0 0; color: var(--muted); max-width: 70ch; }
+.app { max-width: 1500px; margin: 0 auto; padding-inline: 16px; padding-block: 12px 24px;
+  display: grid; grid-template-columns: 300px minmax(0, 1fr) 330px; gap: 16px; align-items: start; }
+@media (max-width: 1220px) { .app { grid-template-columns: 300px minmax(0, 1fr); } .book { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; } }
+@media (max-width: 780px) { .app { grid-template-columns: minmax(0, 1fr); } .chat { order: -1; } }
+
+.col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 14px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.panel h2 { margin: 0; font: 600 13px/1 var(--display); letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+  display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.panel h2 .aside { letter-spacing: 0; text-transform: none; font: 400 12px var(--body); }
+.sub-h { margin: 0; font: 600 11px/1 var(--display); letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.field { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); min-width: 0; }
+input[type=number], input[type=text], select { background: var(--raised); border: 1px solid var(--line); border-radius: 4px; padding: 7px 8px; width: 100%; min-width: 0; font-variant-numeric: tabular-nums; }
+.check { flex-direction: row; align-items: center; gap: 8px; color: var(--ink); font-size: 13px; }
+.btn { border: 1px solid var(--line); background: var(--raised); border-radius: 4px; padding: 8px 12px; cursor: pointer; font-weight: 500; }
+.btn:hover:not(:disabled) { border-color: var(--muted); }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-family: var(--display); font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.08); border-color: var(--accent); }
+.btns { display: flex; flex-wrap: wrap; gap: 8px; }
+.btns .btn { flex: 1 1 auto; }
+.hint { font-size: 12px; color: var(--muted); margin: 0; }
+
+.odds { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.odds td { padding: 5px 0; border-top: 1px solid var(--line); }
+.odds td.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.odds tr:first-child td { border-top: 0; }
+
+/* bet buttons (slip and chat share these) */
+.wl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.bb { border: 1px solid var(--line); background: var(--raised); border-radius: 4px; padding: 9px 10px; cursor: pointer;
+  display: flex; justify-content: space-between; align-items: center; gap: 8px; text-align: left; min-width: 0; }
+.bb:hover:not(:disabled) { border-color: var(--ink); }
+.bb:disabled { opacity: .45; cursor: not-allowed; }
+.bb .lbl { font: 700 14px/1.1 var(--display); letter-spacing: .06em; text-transform: uppercase; }
+.bb .price { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+.bb.w { background: var(--win-soft); border-color: var(--win); } .bb.w .lbl { color: var(--win); }
+.bb.l { background: var(--loss-soft); border-color: var(--loss); } .bb.l .lbl { color: var(--loss); }
+.bb[aria-pressed=true] { box-shadow: inset 0 0 0 2px var(--ink); border-color: var(--ink); }
+.bb[aria-pressed=true]::before { content: "✓"; font-weight: 700; margin-right: -2px; }
+.bb.skip { justify-content: center; color: var(--muted); font-size: 12.5px; }
+.wl .bb.skip { grid-column: 1 / -1; }
+.sect { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+.sect-h { display: flex; justify-content: space-between; align-items: end; gap: 10px; }
+.stake { flex-direction: row; align-items: center; gap: 6px; }
+.stake input { width: 84px; padding: 5px 7px; }
+.opt { font: 400 11px var(--body); letter-spacing: 0; text-transform: none; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 7px; margin-left: 4px; }
+.summary { display: flex; flex-direction: column; gap: 4px; font-size: 13px; padding-top: 10px; border-top: 1px solid var(--line); }
+.summary .row { display: flex; justify-content: space-between; gap: 8px; }
+.summary .row b { font-family: var(--mono); font-weight: 500; }
+.summary .tot { font-weight: 600; }
+.tf { display: flex; flex-direction: column; gap: 6px; }
+.tf .bb .who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.tf .bb .who small { font-weight: 400; color: var(--muted); margin-left: 6px; }
+.chat-bets { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; max-width: 620px; }
+.chat-bets .bb { padding: 6px 10px; flex: 0 1 auto; }
+.chat-bets .bb .lbl { font-size: 12.5px; }
+.chat-bets .bb .price { font-size: 12px; }
+.chat-bets .row-break { flex-basis: 100%; height: 0; }
+
+/* chat */
+.chat { background: var(--chat); border: 1px solid var(--line); border-radius: 6px; display: flex; flex-direction: column; height: calc(100vh - 130px); min-height: 600px; min-width: 0; }
+@media (max-width: 780px) { .chat { height: 78vh; min-height: 520px; } }
+.chat-head { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.chat-head b { font: 600 15px var(--display); letter-spacing: .02em; }
+.chat-head .hash { color: var(--muted); font: 600 18px var(--display); }
+.chat-head .sub { color: var(--muted); font-size: 12px; }
+.feed { flex: 1; overflow-y: auto; padding: 8px 0 12px; min-height: 0; }
+.msg { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 0 12px; padding: 6px 16px; }
+.msg:hover { background: var(--hover); }
+.coins { display: inline-flex; align-items: center; gap: 3px; margin-left: 5px; padding: 0 6px; border: 1px solid var(--gold); border-radius: 999px;
+  color: var(--gold); font: 500 11px/16px var(--mono); font-variant-numeric: tabular-nums; vertical-align: 1px; }
+.coins::before { content: "◎"; font-size: 10px; }
+.msg.bet { display: block; padding: 2px 16px 2px 68px; font-size: 13px; color: var(--muted); }
+.msg.bet b { color: var(--ink); font-weight: 600; }
+.msg.bet .detail { display: none; font-family: var(--mono); font-size: 12px; }
+.msg.bet.mine .detail { display: inline; }
+.av { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; font: 700 15px var(--display); color: #FFFFFF; grid-row: span 3; }
+.av.bot { background: var(--ink); color: var(--bg); clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%); border-radius: 0; }
+.used { grid-column: 2; font-size: 12px; color: var(--muted); display: flex; gap: 6px; align-items: center; min-width: 0; }
+.used code { font-family: var(--mono); color: var(--info); overflow-wrap: anywhere; }
+.meta { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.meta .who { font-weight: 600; }
+.meta .tag { font: 600 10px/1 var(--display); letter-spacing: .06em; background: var(--accent); color: var(--accent-ink); padding: 3px 5px 2px; border-radius: 3px; }
+.meta time { font-size: 11px; color: var(--muted); }
+.body { min-width: 0; overflow-wrap: anywhere; }
+.eph { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+.msg.ephemeral .body { color: var(--muted); }
+.embed { margin-top: 6px; background: var(--embed); border: 1px solid var(--line); border-left: 4px solid var(--c, var(--muted)); border-radius: 4px; padding: 10px 14px 12px; max-width: 620px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.embed .et { font-weight: 600; font-size: 15px; }
+.embed .ed { font-size: 13.5px; }
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px 14px; }
+.f { min-width: 0; font-size: 13px; }
+.f.wide { grid-column: 1 / -1; }
+.f .fn { font-weight: 600; font-size: 12.5px; margin-bottom: 2px; }
+.price { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.efoot { font-size: 11px; color: var(--muted); }
+.board { overflow-x: auto; }
+.board table { border-collapse: collapse; width: 100%; font-size: 12.5px; min-width: 460px; }
+.board th { text-align: left; font: 600 10.5px var(--display); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 4px 6px; }
+.board td { padding: 4px 6px; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.board tr.me td { font-weight: 600; }
+.board .team { font: 600 11px var(--display); letter-spacing: .1em; text-transform: uppercase; padding-top: 10px; }
+.star { color: var(--gold); font-weight: 600; }
+.y { color: var(--win); } .n { color: var(--loss); } .p { color: var(--push); }
+
+.composer { border-top: 1px solid var(--line); padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip { font-family: var(--mono); font-size: 11.5px; border: 1px solid var(--line); background: var(--raised); border-radius: 999px; padding: 3px 9px; cursor: pointer; color: var(--info); }
+.chip:hover { border-color: var(--info); }
+.inrow { display: flex; gap: 8px; align-items: center; }
+.inrow select { width: auto; flex: 0 0 auto; }
+.inrow input { flex: 1; font-family: var(--mono); }
+
+/* book */
+.status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.pill { font: 700 11px/1 var(--display); letter-spacing: .1em; text-transform: uppercase; padding: 5px 8px 4px; border-radius: 3px; border: 1px solid currentColor; }
+.pill.open { color: var(--win); } .pill.locked { color: var(--gold); } .pill.resolved { color: var(--info); } .pill.none, .pill.cancelled { color: var(--muted); }
+.clock { font: 600 20px var(--mono); font-variant-numeric: tabular-nums; }
+.err { color: var(--loss); font-size: 12.5px; min-height: 1em; margin: 0; }
+.pool { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; }
+.pool .row { display: flex; justify-content: space-between; gap: 8px; }
+.pool .amt { font-family: var(--mono); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.bar { height: 8px; border-radius: 2px; background: var(--line); display: flex; overflow: hidden; }
+.bar i { display: block; height: 100%; }
+.bar .by { background: var(--win); } .bar .bn { background: var(--loss); } .bar .bg { background: var(--gold); }
+.lb { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.lb li { display: grid; grid-template-columns: 22px 28px minmax(0,1fr) auto; gap: 8px; align-items: center; padding: 7px 0; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+.lb li:first-child { border-top: 0; }
+.lb .rk { font: 600 13px var(--display); color: var(--muted); }
+.lb .mini { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: #FFFFFF; font: 700 12px var(--display); }
+.lb .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lb .nm small { display: block; color: var(--muted); font-size: 11px; }
+.lb .bal { text-align: right; font-family: var(--mono); }
+.lb .bal small { display: block; font-size: 11px; }
+.mine { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+.mine li { display: flex; justify-content: space-between; gap: 8px; }
+.mine .st { font: 600 10.5px var(--display); letter-spacing: .08em; text-transform: uppercase; white-space: nowrap; }
+@media (prefers-reduced-motion: no-preference) { .msg.new { animation: rise .25s ease-out; } @keyframes rise { from { transform: translateY(4px); opacity: .4; } } }
+</style>
+
+<header class="top">
+  <div>
+    <h1>Valorant <span>Bet</span> Simulator</h1>
+    <p>A working preview of the Discord bot. Bet on two things: whether the team wins, and who top frags on the team. Players, stats and games are simulated in your browser, so nothing calls Discord or tracker.gg. Coins are play money.</p>
+  </div>
+  <button class="btn" id="reset">Reset sandbox</button>
+</header>
+
+<main class="app">
+  <!-- SETUP -->
+  <div class="col">
+    <section class="panel" aria-labelledby="h-host">
+      <h2 id="h-host">Host profile <span class="aside">from tracker.gg</span></h2>
+      <label>Player in the game<select id="hostSel"></select></label>
+      <div class="field">
+        <label>Rank<select id="hRank"></select></label>
+        <label>K/D<input id="hKd" type="number" step="0.01" min="0.3" max="3" value="1.15"></label>
+        <label>Win %<input id="hWin" type="number" step="1" min="0" max="100" value="54"></label>
+        <label>ACS<input id="hAcs" type="number" step="1" min="80" max="400" value="228"></label>
+        <label>Games played<input id="hGames" type="number" step="1" min="0" value="120"></label>
+      </div>
+      <label class="check"><input type="checkbox" id="oppOn" checked> Opponents given at <code>/match open</code></label>
+      <div class="field" id="oppFields">
+        <label>Opponent avg rank<select id="oRank"></select></label>
+        <label>Opponent avg K/D<input id="oKd" type="number" step="0.01" min="0.3" max="3" value="0.95"></label>
+      </div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-odds">
+      <h2 id="h-odds">Odds preview</h2>
+      <table class="odds" id="oddsPreview"></table>
+      <p class="hint">Odds update as you change the profile. They lock in when betting opens.</p>
+    </section>
+
+    <section class="panel" aria-labelledby="h-game">
+      <h2 id="h-game">Game controls</h2>
+      <div class="field">
+        <label>Mode<select id="mode"><option value="competitive">Competitive</option><option value="unrated">Unrated</option><option value="swiftplay">Swiftplay</option><option value="premier">Premier</option></select></label>
+        <label>Bet window (min)<input id="win" type="number" min="1" max="15" value="4"></label>
+      </div>
+      <div class="btns">
+        <button class="btn primary" id="bOpen">Open betting</button>
+      </div>
+      <div class="btns">
+        <button class="btn" id="bFriends">Friends place bets</button>
+        <button class="btn" id="bLock">Lock betting</button>
+      </div>
+      <label>How the game turns out<select id="force"><option value="random">Random, weighted by the odds</option><option value="win">Host's team wins</option><option value="loss">Host's team loses</option></select></label>
+      <div class="btns">
+        <button class="btn primary" id="bFinish">Finish game &amp; settle</button>
+        <button class="btn" id="bCancel">Cancel &amp; refund</button>
+      </div>
+      <div class="btns">
+        <button class="btn" id="bDay">Skip to next day (+50 each)</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- CHAT -->
+  <section class="chat" aria-label="Bot channel">
+    <div class="chat-head"><span class="hash">#</span><b>valorant-bets</b><span class="sub">Click a bet button, or type commands below</span></div>
+    <div class="feed" id="feed" aria-live="polite"></div>
+    <form class="composer" id="composer" autocomplete="off">
+      <div class="chips" id="chips"></div>
+      <div class="inrow">
+        <select id="actor" aria-label="Acting as"></select>
+        <input type="text" id="cmd" placeholder="/bet win 100" aria-label="Command">
+        <button class="btn primary" type="submit">Send</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- BOOK -->
+  <div class="col book">
+    <section class="panel" aria-labelledby="h-slip">
+      <h2 id="h-slip">Place a bet <span class="aside" id="slipWho"></span></h2>
+      <div class="status"><span class="pill none" id="pill">No match</span><span class="clock" id="clock"></span></div>
+      <p class="hint">Betting is optional. Pick either bet, both, or neither. Each one pays out on its own, so losing one doesn't affect the other.</p>
+      <div class="sect">
+        <div class="sect-h"><p class="sub-h">Match result <span class="opt">optional</span></p><label class="stake">Stake<input type="number" id="rAmt" min="10" step="10" value="100"></label></div>
+        <div class="wl" id="slipWL"></div>
+      </div>
+      <div class="sect">
+        <div class="sect-h"><p class="sub-h" id="tfHead">Top frag <span class="opt">optional</span></p><label class="stake">Stake<input type="number" id="tAmt" min="10" step="10" value="50"></label></div>
+        <div class="tf" id="slipTF"></div>
+      </div>
+      <div class="summary" id="summary"></div>
+      <button class="btn primary" id="sPlace">Place bet</button>
+      <p class="err" id="sErr"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="h-pool">
+      <h2 id="h-pool">Money in play</h2>
+      <div id="pools" class="col" style="gap:12px"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="h-lb">
+      <h2 id="h-lb">Leaderboard</h2>
+      <ol class="lb" id="lb"></ol>
+    </section>
+
+    <section class="panel" aria-labelledby="h-mine">
+      <h2 id="h-mine">Your bets <span class="aside" id="mineWho"></span></h2>
+      <ul class="mine" id="mine"></ul>
+    </section>
+  </div>
+</main>
+
+<script>
+// ---------- rules ----------
+const HOUSE_EDGE = 0.05, START = 1000, DAILY = 50, MIN_BET = 10;
+const RANKS = ["Iron", "Bronze", "Silver", "Gold", "Platinum", "Diamond", "Ascendant", "Immortal"].flatMap(r => [1, 2, 3].map(n => `${r} ${n}`)).concat("Radiant");
+const tier = name => RANKS.indexOf(name) + 1;
+const clamp = (x, a, b) => Math.min(Math.max(x, a), b);
+const price = p => { p = clamp(p, 0.04, 0.96); return Math.round(Math.max(1.05, (1 - HOUSE_EDGE) / p) * 100) / 100; };
+
+function winProb(h, opp) {
+  let p = 0.5;
+  if (h.matches >= 5) p += (h.win - 50) / 100 * 0.5;
+  if (opp) {
+    const t = tier(h.rank), o = tier(opp.rank);
+    if (t && o) p += (t - o) * 0.035;
+    p += (h.kd - opp.kd) * 0.25;
+  }
+  return clamp(p, 0.15, 0.85);
+}
+// team = host first, then teammates. Top-frag chance scales steeply with average ACS.
+function buildMarkets(h, opp, team) {
+  const pWin = winProb(h, opp);
+  const w = team.map(p => Math.pow(p.acs / 200, 4) * Math.pow(p.kd, 1.5));
+  const sum = w.reduce((a, b) => a + b, 0);
+  return {
+    win: { p: pWin, win: price(pWin), loss: price(1 - pWin) },
+    topfrag: team.map((p, i) => ({ riot: p.riot, rank: p.rank, p: w[i] / sum, odds: price(w[i] / sum) })),
+  };
+}
+
+// ---------- helpers ----------
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = n => Math.round(n).toLocaleString("en-US");
+const pick = a => a[Math.floor(Math.random() * a.length)];
+const shuffle = a => [...a].sort(() => Math.random() - 0.5);
+const randn = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+function seeded(str) { let h = 2166136261; for (const c of str) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return () => { h = Math.imul(h ^ (h >>> 15), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); return ((h ^= h >>> 16) >>> 0) / 4294967296; }; }
+const short = riot => riot.split("#")[0];
+const AGENTS = ["Jett", "Raze", "Reyna", "Phoenix", "Neon", "Iso", "Yoru", "Waylay", "Sova", "Fade", "Skye", "Breach", "KAY/O", "Gekko", "Tejo", "Omen", "Brimstone", "Astra", "Viper", "Harbor", "Clove", "Sage", "Killjoy", "Cypher", "Chamber", "Deadlock", "Vyse"];
+const MAPS = ["Ascent", "Bind", "Haven", "Lotus", "Sunset", "Split", "Icebox", "Abyss", "Pearl", "Breeze", "Fracture"];
+const OPP_NAMES = ["Rook#EUW", "velvet#7781", "Nyx#000", "pistolpete#NA1", "zephyr#GG", "Hollow#1337", "tako#JP1", "Brisk#4K", "Lumen#777", "oak#TREE", "sable#2525", "Quill#NA2"];
+const MATE_NAMES = ["duoQ#000", "flick#FPS", "smokey#NA1", "anchor#B55", "lurk#3AM", "Echo#ECHO", "mochi#UwU", "Vex#999"];
+const rankNear = (t, spread = 2) => RANKS[clamp(Math.round(t + randn() * spread * 0.6), 1, 25) - 1];
+const time = () => new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const mmss = ms => { const s = Math.max(0, Math.ceil(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+
+// ---------- state ----------
+let S;
+function rollMates(hostRank) {
+  return shuffle(MATE_NAMES).slice(0, 4).map(riot => ({ riot, rank: rankNear(tier(hostRank)), kd: clamp(1 + randn() * 0.18, 0.6, 1.6),
+    acs: clamp(205 + randn() * 30, 140, 290), win: 45 + Math.random() * 12, hs: 15 + Math.random() * 12, matches: 30 + Math.floor(Math.random() * 250) }));
+}
+function freshState() {
+  return {
+    users: [
+      { id: "you", name: "You", riot: "You#NA1", av: "--av1" },
+      { id: "kai", name: "Kai", riot: "kaizen#4410", av: "--av2" },
+      { id: "mara", name: "Mara", riot: "marauder#EUW", av: "--av3" },
+      { id: "jules", name: "Jules", riot: "julesy#2002", av: "--av4" },
+      { id: "theo", name: "Theo", riot: "theo#TTV", av: "--av5" },
+    ].map(u => ({ ...u, balance: START, free: 0 })),
+    day: 1,
+    actor: "you", hostId: "you", match: null, nextMatch: 1, nextBet: 1, mates: rollMates("Diamond 2"), pick: { win: null, topfrag: null },
+  };
+}
+const user = id => S.users.find(u => u.id === id);
+const byName = n => S.users.find(u => u.name.toLowerCase() === n.replace(/^@/, "").toLowerCase());
+
+function hostProfile() {
+  const h = user(S.hostId);
+  return { riot: h.riot, rank: $("#hRank").value, kd: +$("#hKd").value || 1, win: +$("#hWin").value || 50,
+    acs: +$("#hAcs").value || 200, matches: +$("#hGames").value || 0, hs: 24 };
+}
+const oppProfile = () => $("#oppOn").checked ? { rank: $("#oRank").value, kd: +$("#oKd").value || 1 } : null;
+const team = () => [hostProfile(), ...S.mates];
+const statLine = p => `<b>${esc(p.riot)}</b> — ${esc(p.rank)} · ${(+p.kd).toFixed(2)} K/D · ${Math.round(p.win)}% WR · ${Math.round(p.acs)} ACS (${p.matches} games)`;
+function fakeScout(riot) {
+  const r = seeded(riot.toLowerCase());
+  const t = 4 + Math.floor(r() * 20);
+  return { riot, rank: RANKS[t - 1], kd: 0.75 + r() * 0.65, win: 42 + r() * 18, acs: 160 + r() * 110, hs: 14 + r() * 18, matches: 20 + Math.floor(r() * 300) };
+}
+const betLabel = (b, m) => b.market === "win"
+  ? `${short(m.host.riot)}'s team ${b.side === "win" ? "wins" : "loses"}`
+  : `${short(b.side)} top frags`;
+
+// ---------- chat rendering ----------
+function avatar(u) {
+  if (!u) return `<div class="av bot" aria-hidden="true">VB</div>`;
+  return `<div class="av" style="background:var(${u.av})" aria-hidden="true">${esc(u.name[0])}</div>`;
+}
+function embedHtml(e) {
+  const fields = (e.fields || []).map(f => `<div class="f${f.wide ? " wide" : ""}"><div class="fn">${f.name}</div><div>${f.value}</div></div>`).join("");
+  return `<div class="embed" style="--c:var(${e.color || "--muted"})">
+    ${e.title ? `<div class="et">${e.title}</div>` : ""}${e.desc ? `<div class="ed">${e.desc}</div>` : ""}
+    ${fields ? `<div class="fields">${fields}</div>` : ""}${e.html || ""}
+    ${e.footer ? `<div class="efoot">${e.footer}</div>` : ""}</div>`;
+}
+function post({ from = null, used = null, cmd = "", text = "", embeds = [], after = "", ephemeral = false, betBy = null }) {
+  const el = document.createElement("div");
+  if (betBy) {
+    // Compact bet line. The odds/payout/balance part only shows to the person who placed it.
+    el.className = "msg bet new";
+    el.dataset.by = betBy;
+    el.innerHTML = `<div class="body">${text}</div>`;
+    $("#feed").appendChild(el);
+    $("#feed").scrollTop = $("#feed").scrollHeight;
+    return;
+  }
+  const u = from ? user(from) : null;
+  const usedBy = used ? user(used) : null;
+  el.className = "msg new" + (ephemeral ? " ephemeral" : "");
+  el.innerHTML = `${usedBy ? `<div class="used">↳ <b>${esc(usedBy.name)}</b>${coins(usedBy)} used <code>${esc(cmd)}</code></div>` : ""}
+    ${avatar(u)}
+    <div class="meta"><span class="who">${u ? esc(u.name) : "Valorant Bets"}</span>${u ? "" : '<span class="tag">BOT</span>'}<time>Today at ${time()}</time></div>
+    <div class="body">${text}${embeds.map(embedHtml).join("")}${after}${ephemeral ? '<div class="eph">Only you can see this</div>' : ""}</div>`;
+  const feed = $("#feed");
+  feed.appendChild(el);
+  feed.scrollTop = feed.scrollHeight;
+}
+// Balance badge shown next to whoever used a command (their balance right after it ran).
+const coins = u => `<span class="coins" title="${esc(u.name)}'s balance">${fmt(u.balance)}</span>`;
+const reply = (by, cmd, text, extra = {}) => post({ used: by, cmd, text, ...extra });
+const oops = (by, cmd, text) => reply(by, cmd, text, { ephemeral: true });
+
+// The bet buttons, rendered the same way in the slip and under the bot's message.
+// mode "bet": one-click buttons under the bot message. mode "pick": selectable choices in the bet panel.
+function winLossButtons(m, extra = "", mode = "bet") {
+  const pr = s => mode === "pick" ? ` aria-pressed="${S.pick.win === s}"` : "";
+  return `<button type="button" class="bb w" data-${mode}="win" data-side="win"${pr("win")} ${extra}><span class="lbl">Win</span><span class="price">×${m.win.win.toFixed(2)}</span></button>
+    <button type="button" class="bb l" data-${mode}="win" data-side="loss"${pr("loss")} ${extra}><span class="lbl">Loss</span><span class="price">×${m.win.loss.toFixed(2)}</span></button>` +
+    (mode === "pick" ? `<button type="button" class="bb skip" data-pick="win" data-side=""${pr(null)} ${extra}>No result bet</button>` : "");
+}
+function topfragButtons(m, extra = "", mode = "bet") {
+  const pr = s => mode === "pick" ? ` aria-pressed="${S.pick.topfrag === s}"` : "";
+  const compact = mode === "bet";
+  return m.topfrag.map(t => `<button type="button" class="bb" data-${mode}="topfrag" data-side="${esc(t.riot)}"${pr(t.riot)} ${extra}>
+      <span class="who">${compact ? "🎯 " : ""}${esc(short(t.riot))}${compact ? "" : `<small>${esc(t.rank)}</small>`}</span><span class="price">×${t.odds.toFixed(2)}</span></button>`).join("") +
+    (mode === "pick" ? `<button type="button" class="bb skip" data-pick="topfrag" data-side=""${pr(null)} ${extra}>No top frag bet</button>` : "");
+}
+const stakeFor = market => parseInt($(market === "win" ? "#rAmt" : "#tAmt").value, 10);
+function placeSlip() {
+  const picks = Object.entries(S.pick).filter(([, side]) => side);
+  if (!picks.length) return;
+  const total = picks.reduce((a, [k]) => a + (stakeFor(k) || 0), 0);
+  const u = user(S.actor);
+  if (total > u.balance) { $("#sErr").textContent = `That's ${fmt(total)} coins in total, but you only have ${fmt(u.balance)}.`; return; }
+  for (const [k, side] of picks) placeBet(S.actor, k, side, stakeFor(k), k === "win" ? `/bet ${side} ${stakeFor(k)}` : `/bet topfrag ${short(side)} ${stakeFor(k)}`);
+  S.pick = { win: null, topfrag: null };
+  renderSlip();
+}
+function marketsEmbed(m, withPools) {
+  const pools = {};
+  for (const b of m.bets) pools[b.side] = (pools[b.side] || 0) + b.amount;
+  const pool = k => withPools ? ` <span class="hint">(${fmt(pools[k] || 0)} bet)</span>` : "";
+  const scout = [`⭐ ${statLine(m.host)}`, ...m.mates.map(p => `🟦 ${statLine(p)}`)];
+  if (!m.opps.length) scout.push("<i>No opponents given, so there's no enemy recap and win odds use the host's win rate only.</i>");
+  return {
+    color: m.status === "open" ? "--gold" : "--muted",
+    title: `🎲 Bets open: ${esc(m.host.riot)}'s next ${esc(m.mode)} game`,
+    desc: `Betting closes in ${Math.round((m.lockAt - m.openedAt) / 60000)} min. Betting is optional: bet on the result, the top frag, both, or neither. Each bet pays out on its own. Odds are decimal payouts (×2.00 doubles your stake).`,
+    fields: [
+      { name: "Match result", value: `<b class="y">Win</b> <span class="price">×${m.win.win.toFixed(2)}</span>${pool("win")} · <b class="n">Loss</b> <span class="price">×${m.win.loss.toFixed(2)}</span>${pool("loss")}` },
+      { name: "Top frag on the team (most kills)", value: m.topfrag.map(t => `${esc(short(t.riot))} <span class="price">×${t.odds.toFixed(2)}</span>${pool(t.riot)}`).join("<br>") },
+      { name: "Scouting report", value: scout.join("<br>"), wide: true },
+    ],
+    footer: `Match #${m.id} · settles automatically from tracker.gg`,
+  };
+}
+
+// Pre-game recap of every enemy player, strongest first (same rules as enemy_recap_embed in bot.py).
+const threatScore = p => p.kd * 0.6 + p.acs / 220 * 0.4;
+const threat = p => threatScore(p) >= 1.15 ? '<span class="n">🔥 Threat</span>' : threatScore(p) <= 0.9 ? '<span class="y">🎯 Weak link</span>' : '<span class="p">⚖️ Even</span>';
+function enemyRecap(m) {
+  const opps = [...m.opps].sort((a, b) => threatScore(b) - threatScore(a));
+  const avgTier = opps.reduce((a, p) => a + tier(p.rank), 0) / opps.length;
+  const avgKd = opps.reduce((a, p) => a + p.kd, 0) / opps.length;
+  return {
+    color: "--loss",
+    title: `🟥 Enemy team recap: ${esc(short(m.host.riot))}'s next game`,
+    desc: `Average rank <b>${RANKS[clamp(Math.round(avgTier), 1, 25) - 1]}</b> · average K/D <b>${avgKd.toFixed(2)}</b>`,
+    fields: opps.map(p => ({
+      wide: true,
+      name: `${esc(p.riot)} — ${esc(p.rank)} · ${threat(p)}`,
+      value: `K/D <b>${p.kd.toFixed(2)}</b> · Win <b>${Math.round(p.win)}%</b> · ACS <b>${Math.round(p.acs)}</b> · HS <b>${Math.round(p.hs)}%</b><br>` +
+        `<span class="hint">${p.kpm.toFixed(1)} kills/game · ${p.matches} games · Mains: ${p.mains.map(esc).join(", ")}</span>`,
+    })),
+    footer: "Season stats from tracker.gg",
+  };
+}
+
+// ---------- actions ----------
+const isActive = m => m && ["open", "locked"].includes(m.status);
+function openMatch(by = S.actor, cmd = "/match open") {
+  if (isActive(S.match)) return oops(by, cmd, `${esc(user(S.match.hostId).name)} already has an active match. Settle or <code>/match cancel</code> it first.`);
+  if (S.match) S.mates = rollMates($("#hRank").value);  // new lobby for each new game
+  const h = hostProfile(), opp = oppProfile();
+  const minutes = clamp(+$("#win").value || 4, 1, 15);
+  const opps = opp ? shuffle(OPP_NAMES).slice(0, 5).map(riot => ({ riot, rank: rankNear(tier(opp.rank), 1.5), kd: clamp(opp.kd + randn() * 0.12, 0.4, 2.5),
+    win: 42 + Math.random() * 18, acs: 160 + Math.random() * 100, hs: 14 + Math.random() * 16, matches: 30 + Math.floor(Math.random() * 250),
+    mains: shuffle(AGENTS).slice(0, 3) })).map(p => ({ ...p, kpm: p.acs / 13.5 })) : [];
+  const now = Date.now();
+  S.match = { id: S.nextMatch++, hostId: S.hostId, host: h, mates: S.mates, opps, opp, mode: $("#mode").value, status: "open",
+    ...buildMarkets(h, opp, [h, ...S.mates]), openedAt: now, lockAt: now + minutes * 60000, bets: [] };
+  const m = S.match;
+  reply(by, cmd + (opp ? " opponents:" + opps.map(o => o.riot).join(",") : ""), "", {
+    embeds: [marketsEmbed(m, false)],
+    after: `<div class="chat-bets" data-match="${m.id}">${winLossButtons(m)}<span class="row-break"></span>${topfragButtons(m)}</div>`,
+  });
+  if (opps.length) post({ embeds: [enemyRecap(m)] });
+  renderAll();
+}
+const activeOpen = () => S.match && S.match.status === "open" && Date.now() < S.match.lockAt;
+function placeBet(by, market, side, amount, cmd) {
+  const u = user(by), m = S.match;
+  if (!isActive(m)) return oops(by, cmd, "No active match in this channel. Start one with <code>/match open</code>.");
+  if (!activeOpen()) return oops(by, cmd, "Betting is closed for this match.");
+  if (!Number.isFinite(amount) || amount < MIN_BET) return oops(by, cmd, `Minimum bet is ${MIN_BET} coins.`);
+  if (by === m.hostId && market === "win" && side === "loss") return oops(by, cmd, "No betting against yourself 😉");
+  if (u.balance < amount) return oops(by, cmd, `You only have ${fmt(u.balance)} coins.`);
+  let odds;
+  if (market === "win") odds = m.win[side];
+  else { const t = m.topfrag.find(t => t.riot === side); if (!t) return oops(by, cmd, "That player isn't on the team."); odds = t.odds; }
+  u.balance -= amount;
+  const b = { id: S.nextBet++, userId: by, market, side, amount, odds, status: "pending", payout: 0 };
+  m.bets.push(b);
+  post({ betBy: by, text: `🎟️ <b>${esc(u.name)}</b>${coins(u)} bet <b>${fmt(amount)}</b> on <b>${esc(betLabel(b, m))}</b>` +
+    `<span class="detail"> · ×${odds.toFixed(2)} → pays ${fmt(Math.floor(amount * odds))}</span>` });
+  renderAll();
+  return true;
+}
+function clickBet(btn) {
+  const { bet, side } = btn.dataset;
+  const amt = stakeFor(bet);
+  const label = bet === "win" ? `/bet ${side} ${amt}` : `/bet topfrag ${short(side)} ${amt}`;
+  placeBet(S.actor, bet, side, amt, label);
+}
+function lockMatch(by, cmd = "/match lock", auto = false) {
+  const m = S.match;
+  if (!m || m.status !== "open") return auto ? null : oops(by, cmd, m && m.status === "locked" ? "Betting is already closed." : "No open match to lock.");
+  m.status = "locked"; m.lockAt = Math.min(m.lockAt, Date.now());
+  document.querySelectorAll(`.chat-bets[data-match="${m.id}"] button`).forEach(b => b.disabled = true);
+  if (auto) post({ text: `🔒 Betting is closed for <b>${esc(short(m.host.riot))}</b>'s match (#${m.id}). Waiting for the game to finish…` });
+  else reply(by, cmd, `🔒 Betting closed for <b>${esc(short(m.host.riot))}</b>'s match. GLHF!`);
+  renderAll();
+}
+function cancelMatch(by, cmd = "/match cancel") {
+  const m = S.match;
+  if (!isActive(m)) return oops(by, cmd, "No active match to cancel.");
+  let n = 0;
+  for (const b of m.bets) if (b.status === "pending") { b.status = "refunded"; b.payout = b.amount; user(b.userId).balance += b.amount; n++; }
+  m.status = "cancelled";
+  document.querySelectorAll(`.chat-bets[data-match="${m.id}"] button`).forEach(b => b.disabled = true);
+  reply(by, cmd, `🚫 Match #${m.id} cancelled. ${n} bet(s) refunded.`);
+  renderAll();
+}
+function friendsBet() {
+  const m = S.match;
+  if (!activeOpen()) return post({ text: "Open betting first, then friends can bet.", ephemeral: true });
+  const sat = [];
+  for (const f of S.users.filter(u => u.id !== S.actor && u.id !== m.hostId)) {
+    // Each friend independently decides whether to bet on the result and/or top frag.
+    const onResult = Math.random() < 0.6, onTop = Math.random() < 0.45;
+    if (!onResult && !onTop) { sat.push(f.name); continue; }
+    const amt = () => Math.min(f.balance, 10 * Math.round((50 + Math.random() * 250) / 10));
+    let a;
+    if (onResult) {
+      const side = Math.random() < clamp(m.win.p + randn() * 0.15, 0.1, 0.9) ? "win" : "loss";
+      a = amt(); if (a >= MIN_BET) placeBet(f.id, "win", side, a, `/bet ${side} ${a}`);
+    }
+    if (onTop) {
+      let r = Math.random(), t = m.topfrag[0];
+      for (const x of m.topfrag) { if ((r -= x.p) <= 0) { t = x; break; } }
+      a = amt(); if (a >= MIN_BET) placeBet(f.id, "topfrag", t.riot, a, `/bet topfrag ${short(t.riot)} ${a}`);
+    }
+  }
+  if (sat.length) post({ betBy: "_", text: `🪑 <b>${sat.map(esc).join(", ")}</b> sat this one out` });
+}
+
+// Simulate the tracker.gg match the watcher would find.
+function simulateGame(m, force) {
+  const won = force === "win" ? true : force === "loss" ? false : Math.random() < m.win.p;
+  let winR = 13, loseR;
+  if (Math.random() < 0.1) { winR = 14 + Math.floor(Math.random() * 3); loseR = winR - 2; }
+  else loseR = clamp(Math.round(8 - Math.abs(m.win.p - 0.5) * 10 + randn() * 2.8), 0, 11);
+  const total = winR + loseR;
+  const gen = (p, teamId, winning, me = false) => {
+    const a = clamp(p.acs * (winning ? 1.07 : 0.93) + randn() * 45, 60, 480);
+    const kills = Math.max(0, Math.round(a * total / 290 + randn() * 2));
+    return { riot: p.riot, team: teamId, agent: pick(AGENTS), kills, deaths: Math.max(3, Math.round(kills / (p.kd || 1) * 0.6 + total * 0.27 + randn() * 2.5)),
+      assists: Math.floor(1 + Math.random() * 10), acs: a, rank: p.rank, me };
+  };
+  const players = [gen(m.host, "A", won, true), ...m.mates.map(p => gen(p, "A", won))];
+  const opps = m.opps.length ? m.opps : shuffle(OPP_NAMES).slice(0, 5).map(riot => ({ riot, rank: rankNear(tier(m.host.rank)), acs: 205, kd: 1 }));
+  opps.forEach(p => players.push(gen(p, "B", !won)));
+  const ours = players.filter(p => p.team === "A");
+  const top = ours.reduce((a, b) => (b.kills > a.kills || (b.kills === a.kills && b.acs > a.acs)) ? b : a);
+  return { id: Math.random().toString(16).slice(2, 10), map: pick(MAPS), players, total,
+    teams: { A: won ? winR : loseR, B: won ? loseR : winR }, won, topfrag: top.riot };
+}
+function finishGame(by, cmd = "/match settle") {
+  const m = S.match;
+  if (!isActive(m)) return oops(by, cmd, "No active match to settle.");
+  if (m.status === "open") lockMatch(by, cmd, true);
+  m.status = "settling";
+  renderAll();
+  post({ text: `<span class="hint">Checking tracker.gg for ${esc(m.host.riot)}'s newest ${esc(m.mode)} match…</span>` });
+  setTimeout(() => settle(m, simulateGame(m, $("#force").value)), 900);
+}
+function settle(m, g) {
+  const net = {};
+  for (const b of m.bets) {
+    const hit = b.market === "win" ? (b.side === "win") === g.won : b.side === g.topfrag;
+    b.status = hit ? "won" : "lost"; b.payout = hit ? Math.floor(b.amount * b.odds) : 0;
+    user(b.userId).balance += b.payout;
+    net[b.userId] = (net[b.userId] || 0) + b.payout - b.amount;
+  }
+  m.status = "resolved"; m.result = g;
+  const me = g.players[0], tf = g.players.find(p => p.riot === g.topfrag);
+  const payouts = Object.entries(net).sort((a, b) => b[1] - a[1])
+    .map(([id, n]) => `<b>${esc(user(id).name)}</b> <span class="${n >= 0 ? "y" : "n"}">${n >= 0 ? "+" : ""}${fmt(n)}</span>`).join("<br>") || "Nobody bet on this one.";
+  const result = {
+    color: g.won ? "--win" : "--loss",
+    title: `🏁 ${esc(short(m.host.riot))}: ${g.won ? "Victory" : "Defeat"} ${g.teams.A}–${g.teams.B} on ${g.map}`,
+    desc: `${me.agent} · ${me.kills}/${me.deaths}/${me.assists} · ${Math.round(me.acs)} ACS`,
+    fields: [
+      { name: "Match result", value: g.won ? '<span class="y">✅ Win</span>' : '<span class="n">❌ Loss</span>' },
+      { name: "Top frag on the team", value: `<span class="star">★ ${esc(short(tf.riot))}</span> with ${tf.kills} kills` },
+      { name: "Payouts (net)", value: payouts, wide: true },
+    ],
+    footer: `Match #${m.id} · tracker.gg match ${g.id}`,
+  };
+  const rows = t => g.players.filter(p => p.team === t).sort((a, b) => b.kills - a.kills || b.acs - a.acs)
+    .map(p => `<tr class="${p.me ? "me" : ""}"><td>${esc(p.agent)}</td><td>${esc(p.riot)}${p.riot === g.topfrag ? ' <span class="star">★</span>' : ""}</td><td>${p.kills}/${p.deaths}/${p.assists}</td><td>${Math.round(p.acs)}</td><td>${esc(p.rank)}</td></tr>`).join("");
+  const board = {
+    color: "--muted", title: `Scoreboard — ${g.map}`,
+    html: `<div class="board"><table><thead><tr><th>Agent</th><th>Player</th><th>K/D/A</th><th>ACS</th><th>Rank</th></tr></thead><tbody>
+      <tr><td colspan="5" class="team y">🟦 Your team · ${g.teams.A}</td></tr>${rows("A")}
+      <tr><td colspan="5" class="team n">🟥 Opponents · ${g.teams.B}</td></tr>${rows("B")}</tbody></table></div>`,
+  };
+  post({ embeds: [result, board] });
+  renderAll();
+}
+
+// ---------- slash commands ----------
+function run(raw, by = S.actor) {
+  const cmd = raw.trim(); if (!cmd) return;
+  const [head, ...args] = cmd.replace(/^\//, "").split(/\s+/);
+  const u = user(by);
+  const amount = a => a === "max" ? u.balance : parseInt(a, 10);
+  switch (head.toLowerCase()) {
+    case "bet": {
+      const kind = (args[0] || "").toLowerCase();
+      if (kind === "win" || kind === "loss") return placeBet(by, "win", kind, amount(args[1]), cmd);
+      if (kind === "topfrag") {
+        const m = S.match, who = (args[1] || "").toLowerCase();
+        const t = m && m.topfrag.find(t => short(t.riot).toLowerCase() === who || t.riot.toLowerCase() === who);
+        if (!t) return oops(by, cmd, m ? `Pick a player on the team: ${m.topfrag.map(t => `<code>${esc(short(t.riot))}</code>`).join(", ")}.` : "No active match.");
+        return placeBet(by, "topfrag", t.riot, amount(args[2]), cmd);
+      }
+      return oops(by, cmd, "Use <code>/bet win 100</code>, <code>/bet loss 100</code> or <code>/bet topfrag &lt;player&gt; 100</code>.");
+    }
+    case "balance": {
+      const t = args[0] ? byName(args[0]) : u;
+      if (!t) return oops(by, cmd, "No user by that name. Try Kai, Mara, Jules, Theo or You.");
+      return reply(by, cmd, `💰 <b>${esc(t.name)}</b> has <b>${fmt(t.balance)}</b> coins · ${esc(t.riot)}`);
+    }
+    case "give": {
+      const t = byName(args[0] || ""), amt = parseInt(args[1], 10);
+      if (!t || t.id === by) return oops(by, cmd, "Pick someone else, like <code>/give @Kai 100</code>.");
+      if (!(amt > 0)) return oops(by, cmd, "Give a positive amount.");
+      if (u.balance < amt) return oops(by, cmd, `You only have ${fmt(u.balance)} coins.`);
+      u.balance -= amt; t.balance += amt; renderAll();
+      return reply(by, cmd, `💸 <b>${esc(u.name)}</b> gave <b>${esc(t.name)}</b> <b>${fmt(amt)}</b> coins.`);
+    }
+    case "leaderboard": {
+      const lines = [...S.users].sort((a, b) => b.balance - a.balance).map((x, i) => `<b>${i + 1}.</b> ${esc(x.name)} — ${fmt(x.balance)}`).join("<br>");
+      return reply(by, cmd, "", { embeds: [{ color: "--gold", title: "🏆 Leaderboard", desc: lines }] });
+    }
+    case "mybets": {
+      const mine = (S.match ? S.match.bets : []).filter(b => b.userId === by && b.status === "pending");
+      if (!mine.length) return oops(by, cmd, "You have no open bets.");
+      return oops(by, cmd, mine.map(b => `#${S.match.id} · ${fmt(b.amount)} on <b>${esc(betLabel(b, S.match))}</b> (×${b.odds.toFixed(2)})`).join("<br>"));
+    }
+    case "scout": case "link": {
+      const rid = args.join(" ").trim();
+      if (!/^.{1,16}#.{2,5}$/.test(rid)) return oops(by, cmd, "That doesn't look like a Riot ID (Name#TAG).");
+      const p = fakeScout(rid.replace(/\s*#\s*/, "#"));
+      if (head.toLowerCase() === "scout") return reply(by, cmd, statLine(p));
+      u.riot = p.riot; renderAll();
+      return oops(by, cmd, `Linked to ${statLine(p)}`);
+    }
+    case "match": {
+      const sub = (args[0] || "").toLowerCase();
+      if (sub === "open") return openMatch(by, cmd);
+      if (sub === "lock") return lockMatch(by, cmd);
+      if (sub === "cancel") return cancelMatch(by, cmd);
+      if (sub === "settle") return finishGame(by, cmd);
+      if (sub === "status") {
+        if (!isActive(S.match)) return oops(by, cmd, "No active match in this channel. Start one with <code>/match open</code>.");
+        return reply(by, cmd, "", { embeds: [marketsEmbed(S.match, true)] });
+      }
+      return oops(by, cmd, "Use <code>/match open</code>, <code>status</code>, <code>lock</code>, <code>settle</code> or <code>cancel</code>.");
+    }
+    case "help":
+      return oops(by, cmd, "Bets: <code>/bet win 100</code>, <code>/bet loss 100</code>, <code>/bet topfrag &lt;player&gt; 100</code>, or click the buttons.<br>Also: <code>/balance</code>, <code>/give @name amount</code>, <code>/leaderboard</code>, <code>/mybets</code>, <code>/scout Name#TAG</code>, <code>/match open|status|lock|settle|cancel</code>.");
+    default:
+      return oops(by, cmd, `Unknown command <code>/${esc(head)}</code>. Try <code>/help</code>.`);
+  }
+}
+
+// ---------- side panels ----------
+function renderOddsPreview() {
+  const mk = buildMarkets(hostProfile(), oppProfile(), team());
+  $("#oddsPreview").innerHTML = `<tr><td><b class="y">Win</b></td><td class="n">×${mk.win.win.toFixed(2)}</td></tr>
+    <tr><td><b class="n">Loss</b></td><td class="n">×${mk.win.loss.toFixed(2)}</td></tr>` +
+    mk.topfrag.map(t => `<tr><td>Top frag: ${esc(short(t.riot))} <span class="hint">${esc(t.rank)}</span></td><td class="n">×${t.odds.toFixed(2)}</td></tr>`).join("");
+}
+function renderStatus() {
+  const m = S.match, pill = $("#pill"), clock = $("#clock");
+  let st = m ? m.status : "none";
+  if (st === "open" && Date.now() >= m.lockAt) { lockMatch(m.hostId, "", true); return; }
+  pill.className = "pill " + (st === "settling" ? "locked" : st);
+  pill.textContent = { none: "No match", open: "Betting open", locked: "Game in progress", settling: "Settling", resolved: "Settled", cancelled: "Cancelled" }[st];
+  clock.textContent = st === "open" ? mmss(m.lockAt - Date.now()) : "";
+}
+function renderSlip() {
+  const m = S.match, u = user(S.actor);
+  $("#slipWho").textContent = `as ${u.name} · ${fmt(u.balance)} coins`;
+  const mk = isActive(m) || (m && m.status === "settling") ? m : buildMarkets(hostProfile(), oppProfile(), team());
+  const dis = activeOpen() ? "" : "disabled";
+  $("#tfHead").innerHTML = `Top frag on ${esc(short(user(m && isActive(m) ? m.hostId : S.hostId).riot))}'s team <span class="opt">optional</span>`;
+  if (S.pick.topfrag && !mk.topfrag.some(t => t.riot === S.pick.topfrag)) S.pick.topfrag = null;
+  $("#slipWL").innerHTML = winLossButtons(mk, dis, "pick");
+  $("#slipTF").innerHTML = topfragButtons(mk, dis, "pick");
+
+  const rows = [];
+  if (S.pick.win) {
+    const s = stakeFor("win") || 0;
+    rows.push(`<div class="row"><span>${S.pick.win === "win" ? "Win" : "Loss"} · ${fmt(s)}</span><span>pays <b class="y">${fmt(Math.floor(s * mk.win[S.pick.win]))}</b></span></div>`);
+  }
+  if (S.pick.topfrag) {
+    const s = stakeFor("topfrag") || 0, t = mk.topfrag.find(t => t.riot === S.pick.topfrag);
+    rows.push(`<div class="row"><span>${esc(short(t.riot))} top frags · ${fmt(s)}</span><span>pays <b class="y">${fmt(Math.floor(s * t.odds))}</b></span></div>`);
+  }
+  const n = rows.length;
+  const total = (S.pick.win ? stakeFor("win") || 0 : 0) + (S.pick.topfrag ? stakeFor("topfrag") || 0 : 0);
+  if (n) rows.push(`<div class="row tot"><span>Total stake</span><b>${fmt(total)}</b></div>`);
+  $("#summary").innerHTML = n ? rows.join("") : '<span class="hint">No bets picked. You can sit this game out.</span>';
+  $("#sPlace").textContent = n === 2 ? "Place 2 bets" : "Place bet";
+  $("#sPlace").disabled = !activeOpen() || !n;
+  $("#sErr").textContent = activeOpen() ? "" : (m && (isActive(m) || m.status === "settling") ? "Betting is closed for this match." : "Open betting to place bets.");
+}
+function renderPools() {
+  const m = S.match;
+  if (!m) { $("#pools").innerHTML = '<p class="hint">No match yet.</p>'; return; }
+  const sum = {}; for (const b of m.bets) sum[b.side] = (sum[b.side] || 0) + b.amount;
+  const g = m.result;
+  const w = sum.win || 0, l = sum.loss || 0, t = w + l;
+  const tfMax = Math.max(1, ...m.topfrag.map(x => sum[x.riot] || 0));
+  $("#pools").innerHTML = `<div class="pool"><div class="row"><span>Match result${g ? ` <span class="${g.won ? "y" : "n"}">${g.won ? "WIN" : "LOSS"}</span>` : ""}</span>
+      <span class="amt"><span class="y">Win ${fmt(w)}</span> · <span class="n">Loss ${fmt(l)}</span></span></div>
+      <div class="bar">${t ? `<i class="by" style="width:${w / t * 100}%"></i><i class="bn" style="width:${l / t * 100}%"></i>` : ""}</div></div>
+    <p class="sub-h">Top frag</p>` +
+    m.topfrag.map(x => `<div class="pool"><div class="row"><span>${esc(short(x.riot))}${g && g.topfrag === x.riot ? ' <span class="star">★ top frag</span>' : ""}</span><span class="amt">${fmt(sum[x.riot] || 0)}</span></div>
+      <div class="bar"><i class="bg" style="width:${(sum[x.riot] || 0) / tfMax * 100}%"></i></div></div>`).join("");
+}
+function renderLeaderboard() {
+  const inPlay = id => S.match ? S.match.bets.filter(b => b.userId === id && b.status === "pending").reduce((a, b) => a + b.amount, 0) : 0;
+  $("#lb").innerHTML = [...S.users].sort((a, b) => b.balance - a.balance).map((u, i) => {
+    const d = u.balance + inPlay(u.id) - START - u.free;  // betting profit only, not free coins
+    return `<li><span class="rk">${i + 1}</span><span class="mini" style="background:var(${u.av})">${esc(u.name[0])}</span>
+      <span class="nm">${esc(u.name)}${u.id === S.hostId ? " 🎯" : ""}<small>${esc(u.riot)}${inPlay(u.id) ? ` · ${fmt(inPlay(u.id))} in play` : ""}</small></span>
+      <span class="bal">${fmt(u.balance)}<small class="${d > 0 ? "y" : d < 0 ? "n" : "p"}">${d > 0 ? "+" : ""}${fmt(d)}</small></span></li>`;
+  }).join("");
+}
+function renderMine() {
+  const u = user(S.actor);
+  $("#mineWho").textContent = `· ${u.name}`;
+  const bets = S.match ? S.match.bets.filter(b => b.userId === S.actor) : [];
+  const cls = { pending: "p", won: "y", lost: "n", refunded: "p" };
+  $("#mine").innerHTML = bets.length ? bets.map(b => `<li><span>${fmt(b.amount)} on <b>${esc(betLabel(b, S.match))}</b> <span class="price hint">×${b.odds.toFixed(2)}</span></span>
+    <span class="st ${cls[b.status]}">${b.status === "won" ? "+" + fmt(b.payout) : b.status}</span></li>`).join("") : '<li class="hint">No bets on this match.</li>';
+}
+function renderControls() {
+  const m = S.match, active = isActive(m);
+  $("#bOpen").disabled = active || (m && m.status === "settling");
+  $("#bFriends").disabled = !activeOpen();
+  $("#bLock").disabled = !(m && m.status === "open");
+  $("#bFinish").disabled = !active;
+  $("#bCancel").disabled = !active;
+  $("#oppFields").hidden = !$("#oppOn").checked;
+}
+function markMine() { document.querySelectorAll(".msg.bet").forEach(el => el.classList.toggle("mine", el.dataset.by === S.actor)); }
+function renderAll() { markMine(); renderStatus(); renderSlip(); renderPools(); renderLeaderboard(); renderMine(); renderControls(); renderOddsPreview(); }
+
+// ---------- wiring ----------
+function fillSelects() {
+  $("#hRank").innerHTML = $("#oRank").innerHTML = RANKS.map(r => `<option>${r}</option>`).join("");
+  $("#hRank").value = "Diamond 2"; $("#oRank").value = "Platinum 3";
+  $("#hostSel").innerHTML = $("#actor").innerHTML = S.users.map(u => `<option value="${u.id}">${esc(u.name)}</option>`).join("");
+  $("#hostSel").value = S.hostId; $("#actor").value = S.actor;
+  $("#chips").innerHTML = ["/bet win 100", "/bet loss 50", "/bet topfrag You 100", "/match status", "/mybets", "/balance", "/leaderboard", "/help"]
+    .map(c => `<button type="button" class="chip">${c}</button>`).join("");
+}
+const isStake = el => el.id === "rAmt" || el.id === "tAmt";
+document.addEventListener("input", e => { if (isStake(e.target)) renderSlip(); else if (e.target.closest(".panel")) renderAll(); });
+document.addEventListener("change", e => {
+  if (e.target.id === "hostSel") S.hostId = e.target.value;
+  if (e.target.id === "actor") { S.actor = e.target.value; S.pick = { win: null, topfrag: null }; }
+  if (!isStake(e.target)) renderAll();
+});
+document.addEventListener("click", e => {
+  const b = e.target.closest("button[data-bet], button[data-pick]");
+  if (!b || b.disabled) return;
+  if (b.dataset.bet) return clickBet(b);
+  const k = b.dataset.pick, side = b.dataset.side || null;
+  S.pick[k] = S.pick[k] === side ? null : side;  // clicking a picked choice again un-picks it
+  renderSlip();
+});
+$("#sPlace").addEventListener("click", placeSlip);
+$("#composer").addEventListener("submit", e => { e.preventDefault(); run($("#cmd").value); $("#cmd").value = ""; });
+$("#chips").addEventListener("click", e => { if (e.target.classList.contains("chip")) { $("#cmd").value = e.target.textContent; $("#cmd").focus(); } });
+$("#bOpen").addEventListener("click", () => openMatch());
+$("#bFriends").addEventListener("click", friendsBet);
+$("#bLock").addEventListener("click", () => lockMatch(S.actor));
+$("#bFinish").addEventListener("click", () => finishGame(S.actor));
+$("#bCancel").addEventListener("click", () => cancelMatch(S.actor));
+$("#reset").addEventListener("click", boot);
+$("#bDay").addEventListener("click", () => {
+  S.day++;
+  for (const u of S.users) { u.balance += DAILY; u.free += DAILY; }  // silent: no chat message
+  renderAll();
+});
+
+function boot() {
+  S = freshState();
+  $("#feed").innerHTML = "";
+  fillSelects();
+  post({ text: "👋 This is a sandbox. You're acting as <b>You</b>, and you're also the player in the game. Switch who's betting with the menu next to the command box. Betting is optional: pick a result, a top fragger, both, or neither in the bet panel. The buttons under the bot's message place a quick bet using that bet type's stake.", ephemeral: true });
+  openMatch("you");
+  const m = S.match;
+  placeBet("kai", "win", "win", 200, "/bet win 200");
+  placeBet("mara", "win", "loss", 150, "/bet loss 150");
+  placeBet("jules", "topfrag", m.topfrag[0].riot, 100, `/bet topfrag ${short(m.topfrag[0].riot)} 100`);
+  placeBet("jules", "win", "win", 60, "/bet win 60");
+  post({ betBy: "_", text: "🪑 <b>Theo</b> sat this one out" });
+  renderAll();
+}
+boot();
+setInterval(renderStatus, 1000);
+</script>

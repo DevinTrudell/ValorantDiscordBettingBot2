@@ -1,0 +1,17 @@
+[Unit]
+Description=Valorant / Overwatch betting Discord bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=valbet
+WorkingDirectory=/opt/valbet
+# Listen on the home network so the Overwolf app on the gaming PC can reach the bot.
+Environment=DASHBOARD_HOST=0.0.0.0
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/valbet/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
