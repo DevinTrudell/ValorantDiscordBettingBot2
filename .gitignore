@@ -1,0 +1,15 @@
+# Secrets and private data: never commit these
+.env
+*.db
+*.db-wal
+*.db-shm
+presence_log.jsonl
+overwolf-app/config.js
+ha-webhook-url.txt
+valbet-bundle.tar.gz
+debug_*.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
