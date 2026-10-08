@@ -124,6 +124,10 @@ class MatchPlayer:
     rounds: int | None = None
     rank: str = "Unranked"
     party: str | None = None  # players who queued together share this (HenrikDev data only)
+    perf: float | None = None          # Valorant's "Performance Score" (HenrikDev data only)
+    first_bloods: int | None = None
+    plants: int | None = None
+    defuses: int | None = None
 
 
 @dataclass
@@ -161,6 +165,7 @@ class TrackerClient:
         self._cache: dict[str, tuple[float, dict]] = {}
         self._profile_ttl = profile_ttl
         self._gate = asyncio.Semaphore(2)  # stay well under tracker.gg's rate limit
+        self._rejected_until = 0.0
 
     async def close(self):
         if self._session and not self._session.closed:
@@ -184,6 +189,8 @@ class TrackerClient:
                 timeout=aiohttp.ClientTimeout(total=20),
             )
 
+        if time.monotonic() < self._rejected_until:  # key refused recently: don't wait on retries for every player
+            raise TrackerError("tracker.gg rejected the API key (HTTP 401). Check TRACKER_API_KEY.")
         net_error: Exception | None = None
         for attempt in range(3):
             try:
@@ -217,6 +224,7 @@ class TrackerClient:
                     "That profile is private. The player must sign in at tracker.gg once to make it public."
                 )
             if status in (401, 403):
+                self._rejected_until = time.monotonic() + 1800  # try the key again in 30 minutes
                 raise TrackerError(f"tracker.gg rejected the API key (HTTP {status}). Check TRACKER_API_KEY.")
             if status == 429 or status >= 500:
                 try:

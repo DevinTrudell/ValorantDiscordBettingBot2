@@ -42,6 +42,17 @@ def agent_name(code: str | None) -> str:
     return AGENTS.get(code or "", code or "?")
 
 
+HIDDEN_TAG = "AGENT"  # stands in for the tag of a teammate whose name is hidden: "Reyna#AGENT"
+
+
+def hidden_id(agent: str) -> str:
+    return f"{agent}#{HIDDEN_TAG}"
+
+
+def is_hidden(riot: str | None) -> bool:
+    return bool(riot) and riot.endswith("#" + HIDDEN_TAG)
+
+
 def _json(value):
     if isinstance(value, str):
         try:
@@ -72,6 +83,11 @@ def lineup(payload: dict) -> tuple[str | None, list[str], list[str], dict[str, s
         if r.get("local") and not me:
             me = rid
         if not rid:
+            # A teammate with a hidden name: list them by their agent ("Reyna#AGENT") once it's picked
+            locked = r.get("locked")
+            if (r.get("teammate") and not r.get("local") and r.get("character")
+                    and (locked is None or str(locked).lower() in ("true", "1") or payload.get("event") == "match_start")):
+                mates.append(hidden_id(agent_name(r["character"])))
             continue
         ranks[rid] = rank_name(r.get("rank"))
         if r.get("local") or (me and rid.casefold() == me.casefold()):
@@ -84,9 +100,8 @@ def final_detail(payload: dict, me: str, ranks: dict[str, str]) -> MatchDetail |
     """A finished game, built from the end-of-match scoreboard, in the same shape tracker.gg gives."""
     players = []
     for s in payload.get("scoreboard") or []:
-        rid = me if s.get("is_local") else riot_id(s.get("name"))
-        if not rid:
-            continue
+        # Hidden names still count: shown by their agent ("Reyna"), so both teams have all 5
+        rid = me if s.get("is_local") else (riot_id(s.get("name")) or hidden_id(agent_name(s.get("character"))))
         players.append(MatchPlayer(
             riot_id=rid, team="A" if s.get("teammate") or s.get("is_local") else "B",
             agent=agent_name(s.get("character")), kills=int(s.get("kills") or 0),

@@ -1,5 +1,5 @@
 [Unit]
-Description=Valorant / Overwatch betting Discord bot
+Description=Valorant betting Discord bot
 Wants=network-online.target
 After=network-online.target
 

@@ -15,6 +15,7 @@ import logging
 import os
 import secrets
 import socket
+import time
 
 from aiohttp import web
 
@@ -25,6 +26,7 @@ log = logging.getLogger("valbet.overwolf")
 HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("DASHBOARD_PORT", "8787"))
 TOKEN = os.getenv("DASHBOARD_TOKEN") or db.get_or_create_meta("dashboard_token", lambda: secrets.token_urlsafe(18))
+_HA_SEEN: dict[str, float] = {}  # sender -> when we last logged a batch from them
 
 
 async def start(bot) -> None:
@@ -53,7 +55,8 @@ async def start(bot) -> None:
 def _cors(request) -> dict:
     """The Overwolf app's page lives at overwolf-extension://…; only that origin may call the bot cross-site."""
     origin = request.headers.get("Origin", "")
-    if origin.startswith("overwolf-extension://"):
+    # Overwolf apps call from overwolf-extension://<id> or https://www.overwolf.com/<id> (newer Overwolf)
+    if origin.startswith(("overwolf-extension://", "https://www.overwolf.com/")):
         return {"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Headers": "Content-Type, X-Token",
                 "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Private-Network": "true",
                 "Vary": "Origin"}
@@ -71,6 +74,28 @@ OWN = _own_addresses()
 
 
 TAILSCALE = (ipaddress.ip_network("100.64.0.0/10"), ipaddress.ip_network("fd7a:115c:a1e0::/48"))
+_lan6: tuple[float, list] = (0.0, [])
+
+
+def _home_ipv6_nets() -> list:
+    """The home network's public IPv6 range(s), from this machine's own addresses (Linux). <name>.local often
+    resolves to IPv6, so the gaming PC arrives from its public IPv6 address, which is still on the home network.
+    Re-read every 5 minutes, since ISPs change the prefix now and then."""
+    global _lan6
+    if time.time() - _lan6[0] < 300:
+        return _lan6[1]
+    nets = []
+    try:
+        with open("/proc/net/if_inet6") as f:
+            for line in f:
+                addr, _, plen, scope, _, dev = line.split()
+                if scope == "00" and dev != "lo":  # global addresses only
+                    ip = ipaddress.ip_address(":".join(addr[i:i + 4] for i in range(0, 32, 4)))
+                    nets.append(ipaddress.ip_network(f"{ip}/{int(plen, 16)}", strict=False))
+    except (OSError, ValueError):
+        pass
+    _lan6 = (time.time(), nets)
+    return nets
 
 
 def _from_home(remote: str | None) -> bool:
@@ -83,12 +108,17 @@ def _from_home(remote: str | None) -> bool:
     if getattr(ip, "ipv4_mapped", None):
         ip = ip.ipv4_mapped
     return (ip.is_loopback or ip.is_private or ip.is_link_local or str(ip) in OWN
-            or any(ip in net for net in TAILSCALE if ip.version == net.version))
+            or any(ip in net for net in TAILSCALE if ip.version == net.version)
+            or (ip.version == 6 and any(ip in net for net in _home_ipv6_nets())))
 
 
 @web.middleware
 async def _auth(request, handler):
+    if os.getenv("RECEIVER_DEBUG") == "1":  # troubleshooting: every request, without the key
+        log.info("Request %s %s from %s (Origin %s)", request.method, request.path.split("/api/ha/")[0] or "/api/ha",
+                 request.remote, request.headers.get("Origin"))
     if not _from_home(request.remote):
+        log.info("Refused a request from outside the home network (%s)", request.remote)
         return web.Response(status=403)
     if request.method == "OPTIONS":
         return await handler(request)
@@ -97,6 +127,7 @@ async def _auth(request, handler):
         # a person's own key (from /overwolf-link): only accepted for reports about their own games
         owner = db.overwolf_key_owner(key)
         if owner is None:
+            log.info("HA app request refused: unknown key")
             return web.json_response({"error": "Unknown key. Get your address with /overwolf-link in Discord."},
                                      status=401, headers=_cors(request))
         request["owner"] = owner
@@ -122,7 +153,13 @@ async def _ha(request):
     except json.JSONDecodeError:
         raise ValueError("Bad request.") from None
     owner = request.get("owner")  # None = the bot owner's master key: any linked player
-    used = request.app["bridge"].feed(f"{request.remote}|{owner}", batch, owner)
+    sender = f"{request.remote}|{owner}"
+    if time.time() - _HA_SEEN.get(sender, 0) > 300:  # proof the app is connected, without logging every batch
+        _HA_SEEN[sender] = time.time()
+        kinds = sorted({str((e or {}).get("type")) for e in batch}) if isinstance(batch, list) else "?"
+        log.info("HA app connected (owner %s): %s item(s), types %s", owner or "master key",
+                 len(batch) if isinstance(batch, list) else "?", kinds)
+    used = request.app["bridge"].feed(sender, batch, owner)
     return web.json_response({"ok": True, "used": used}, headers=_cors(request))
 
 

@@ -5,13 +5,14 @@ Needs a free key in .env as HENRIK_API_KEY (get one from the HenrikDev Discord).
 with every player's name, team, party, agent, rank and combat score, so the bot can:
   - name your party members (exact party IDs from your recent games) as top-frag options,
   - settle top-frag and group bets from the real scoreboard right after the game,
-  - use recent form for the odds while tracker.gg isn't available.
+  - give rank, season record and recent form for the odds (the bot's main data source; tracker.gg is a backup).
 There's no live data: betting still opens from Discord status.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import ssl
 import time
@@ -23,6 +24,7 @@ import certifi
 
 from tracker import MatchDetail, MatchPlayer, TeamResult, TrackerError
 
+log = logging.getLogger("valbet.henrik")
 BASE = "https://api.henrikdev.xyz"
 KEY = os.getenv("HENRIK_API_KEY", "").strip()
 
@@ -51,16 +53,35 @@ def to_detail(d: dict) -> MatchDetail | None:
         r = t.get("rounds") or {}
         teams[t.get("team_id")] = TeamResult(won=t.get("won"), rounds_won=r.get("won"))
     total_rounds = sum((t.rounds_won or 0) for t in teams.values()) or len(d.get("rounds") or []) or None
+    # First bloods (first kill of each round), plants and defuses, per player
+    name = lambda x: f"{(x or {}).get('name')}#{(x or {}).get('tag')}"
+    first_kill: dict[int, dict] = {}
+    for k in d.get("kills") or []:
+        r = k.get("round")
+        if r is not None and (r not in first_kill or k.get("time_in_round_in_ms", 0) < first_kill[r].get("time_in_round_in_ms", 0)):
+            first_kill[r] = k
+    fb, plants, defuses = {}, {}, {}
+    for k in first_kill.values():
+        fb[name(k.get("killer"))] = fb.get(name(k.get("killer")), 0) + 1
+    for rd in d.get("rounds") or []:
+        for key, table in (("plant", plants), ("defuse", defuses)):
+            if (rd.get(key) or {}).get("player"):
+                n = name(rd[key]["player"])
+                table[n] = table.get(n, 0) + 1
     players = []
     for p in d.get("players") or []:
         st = p.get("stats") or {}
         score = float(st.get("score") or 0)
+        rid = f"{p.get('name')}#{p.get('tag')}"
+        perf = (p.get("performance") or {}).get("score")
         players.append(MatchPlayer(
             riot_id=f"{p.get('name')}#{p.get('tag')}", team=p.get("team_id") or "?",
             agent=(p.get("agent") or {}).get("name") or "?", kills=int(st.get("kills") or 0),
             deaths=int(st.get("deaths") or 0), assists=int(st.get("assists") or 0), score=score,
             acs=score / total_rounds if total_rounds else None, rounds=total_rounds,
-            rank=(p.get("tier") or {}).get("name") or "Unranked", party=p.get("party_id")))
+            rank=(p.get("tier") or {}).get("name") or "Unranked", party=p.get("party_id"),
+            perf=float(perf) if perf is not None else None, first_bloods=fb.get(rid, 0),
+            plants=plants.get(rid, 0), defuses=defuses.get(rid, 0)))
     queue = meta.get("queue") or {}
     return MatchDetail(id=meta.get("match_id") or "?", map=(meta.get("map") or {}).get("name") or "Unknown map",
                        mode=queue.get("name") or queue.get("id") or "?", timestamp=_ts(meta.get("started_at")),
@@ -130,6 +151,61 @@ class HenrikClient:
         data = await self._get(f"/valorant/v4/matches/{region}/pc/{quote(name)}/{quote(tag)}?size={size}")
         out = [to_detail(m) for m in data.get("data") or []]
         return [d for d in out if d]
+
+    async def summary(self, riot_id: str, region: str | None = None) -> dict | None:
+        """Their current Competitive rank plus this season's wins/games:
+        {"rank": "Silver 1", "wins": 12, "games": 25}. Cached for an hour. None if unknown."""
+        key = riot_id.casefold()
+        if not hasattr(self, "_ranks"):
+            self._ranks = {}
+        hit = self._ranks.get(key)
+        if hit and time.time() - hit[1] < 3600:
+            return hit[0]
+        name, _, tag = riot_id.partition("#")
+        try:
+            region = region or next(iter(self._regions.values()), None) or await self.region(riot_id)
+            data = (await self._get(f"/valorant/v3/mmr/{region}/pc/{quote(name)}/{quote(tag)}")).get("data") or {}
+        except HenrikError as e:
+            log.info("No current rank for %s: %s", riot_id, e)
+            if "rate limit" in str(e):
+                raise  # let callers stop early instead of using up the minute
+            self._ranks[key] = (None, time.time())
+            return None
+        # Recent record: the newest acts that have games (newest last in the list), until there are 20+ games.
+        wins = games = 0
+        for season in reversed(data.get("seasonal") or []):
+            if games >= 20:
+                break
+            wins += int((season or {}).get("wins") or 0)
+            games += int((season or {}).get("games") or 0)
+        out = {"rank": ((data.get("current") or {}).get("tier") or {}).get("name"), "wins": wins, "games": games}
+        self._ranks[key] = (out, time.time())
+        return out
+
+    async def current_rank(self, riot_id: str, region: str | None = None) -> str | None:
+        """Their current Competitive rank ('Silver 1'), cached for an hour. None if unknown."""
+        s = await self.summary(riot_id, region)
+        return s["rank"] if s else None
+
+    async def fill_ranks(self, detail: MatchDetail):
+        """Unrated modes (Swiftplay, Unrated...) record everyone as 'Unrated': show their current
+        Competitive rank instead."""
+        missing = [p for p in detail.players if (p.rank or "").lower() in ("unrated", "unranked", "")]
+        if not missing:
+            return
+        region = next(iter(self._regions.values()), None)  # everyone in a match shares a region
+        ranks = []
+        for i, p in enumerate(missing):  # one at a time, spaced out: kinder to the free key's rate limit
+            try:
+                ranks.append(await self.current_rank(p.riot_id, region))
+            except HenrikError:  # rate limit reached: the rest just show unranked
+                ranks += [None] * (len(missing) - len(ranks))
+                break
+            if i < len(missing) - 1:
+                await asyncio.sleep(1.5)
+        for p, r in zip(missing, ranks):
+            if isinstance(r, str) and r and r.lower() not in ("unrated", "unranked"):
+                p.rank = r
 
     async def close(self):
         if self._session and not self._session.closed:

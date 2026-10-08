@@ -73,7 +73,7 @@ conn.executescript(
 for _table, _col, _ddl in (("users", "battletag", "TEXT"), ("matches", "game", "TEXT NOT NULL DEFAULT 'valorant'"),
                            ("matches", "outcome", "TEXT"),  # win | loss | push, for checking the odds afterwards
                            ("bets", "grp", "INTEGER NOT NULL DEFAULT 0"),  # 1 = part of a group pool
-                           ("users", "ow_id", "TEXT")):  # Blizzard player ID for the linked BattleTag
+                           ("users", "ow_id", "TEXT")):  # (battletag / ow_id: unused, left from Overwatch support)
     if _col not in {r[1] for r in conn.execute(f"PRAGMA table_info({_table})")}:
         conn.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} {_ddl}")
 
@@ -150,6 +150,17 @@ def linked_riot_id(discord_id: int) -> str | None:
     return row[0] if row else None
 
 
+def game_players(m) -> list[tuple[int, str]]:
+    """Linked people playing in a match's game, host first: [(discord_id, riot_id)]. They can't bet on
+    their own team losing."""
+    out = [(m["host_id"], m["host_riot"])]
+    for t in json.loads(m["scouting"] or "{}").get("teammates", []):
+        uid = riot_owner(t["riot_id"])
+        if uid and uid not in {u for u, _ in out}:
+            out.append((uid, t["riot_id"]))
+    return out
+
+
 def user_by_riot(riot_id: str) -> int | None:
     """Discord ID of whoever linked this Riot ID (case-insensitive)."""
     return riot_owner(riot_id)
@@ -164,24 +175,10 @@ def riot_owner(riot_id: str) -> int | None:
     return None
 
 
-def battletag_owner(battletag: str) -> int | None:
-    """Discord ID that has this Overwatch BattleTag linked (case-insensitive)."""
-    want = battletag.casefold()
-    for discord_id, tag in conn.execute("SELECT discord_id, battletag FROM users WHERE battletag IS NOT NULL"):
-        if tag.casefold() == want:
-            return discord_id
-    return None
-
-
-def set_battletag(discord_id: int, battletag: str, ow_id: str | None = None):
-    get_user(discord_id)
-    conn.execute("UPDATE users SET battletag = ?, ow_id = ? WHERE discord_id = ?", (battletag, ow_id, discord_id))
-
-
 def is_linked(discord_id: int) -> bool:
-    """Has a Riot ID or BattleTag linked (the bot only follows the games of people who opted in)."""
-    row = conn.execute("SELECT riot_id, battletag FROM users WHERE discord_id = ?", (discord_id,)).fetchone()
-    return bool(row and (row[0] or row[1]))
+    """Has a Riot ID linked (the bot only follows the games of people who opted in)."""
+    row = conn.execute("SELECT riot_id FROM users WHERE discord_id = ?", (discord_id,)).fetchone()
+    return bool(row and row[0])
 
 
 def set_riot_id(discord_id: int, riot_id: str):
@@ -190,9 +187,9 @@ def set_riot_id(discord_id: int, riot_id: str):
 
 
 def unlink(discord_id: int) -> bool:
-    """Forget someone's Riot ID and BattleTag (balance and bets stay). False if nothing was linked."""
-    return conn.execute("UPDATE users SET riot_id = NULL, battletag = NULL, ow_id = NULL WHERE discord_id = ? "
-                        "AND (riot_id IS NOT NULL OR battletag IS NOT NULL)", (discord_id,)).rowcount == 1
+    """Forget someone's Riot ID (balance and bets stay). False if nothing was linked."""
+    return conn.execute("UPDATE users SET riot_id = NULL WHERE discord_id = ? AND riot_id IS NOT NULL",
+                        (discord_id,)).rowcount == 1
 
 
 def transfer(src: int, dst: int, amount: int):
@@ -354,6 +351,20 @@ def place_bet(match_id: int, user_id: int, market: str, side: str, amount: int, 
         c.execute("INSERT INTO bets (match_id, user_id, market, side, amount, odds, grp) VALUES (?, ?, ?, ?, ?, ?, ?)",
                   (match_id, user_id, market, side, amount, odds, int(grp)))
         return bal - amount
+
+
+def cancel_bet(bet_id: int, user_id: int) -> int:
+    """Take back your own bet while betting is still open: full refund. Returns the amount. Raises ValueError."""
+    with Tx() as c:
+        b = c.execute("SELECT * FROM bets WHERE id = ? AND user_id = ?", (bet_id, user_id)).fetchone()
+        if not b or b["status"] != "pending":
+            raise ValueError("That bet can't be cancelled any more.")
+        status = c.execute("SELECT status FROM matches WHERE id = ?", (b["match_id"],)).fetchone()[0]
+        if status != "open":
+            raise ValueError("Betting has closed, so bets are locked in.")
+        c.execute("UPDATE bets SET status = 'refunded', payout = amount WHERE id = ?", (bet_id,))
+        c.execute("UPDATE users SET balance = balance + ? WHERE discord_id = ?", (b["amount"], user_id))
+        return b["amount"]
 
 
 def bets_for_match(match_id: int) -> list[sqlite3.Row]:

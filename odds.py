@@ -20,7 +20,13 @@ MAP_PRIOR = 8         # same for the win rate on one map, pulled towards the pla
 MAP_MAX = 0.06        # the map can move the win chance by at most ±6%
 MODE_ROUNDS = {"swiftplay": 5, "spikerush": 4}  # rounds needed to win; everything else plays to 13
 CAL_MIN_GAMES = 30    # self-tuning starts once this many predicted games have a result
-ACS_SD = 0.28         # typical game-to-game spread of a player's ACS, as a share of their average
+# Tuned on 230 of the group's past games and 70 scoreboards (replayed, each predicted from earlier games only):
+# win rate, streak and map record didn't predict results at all (matchmaking evens them out), the group as a
+# whole wins ~46% (pulled a little towards 50%), and top scores swing more, with randoms scoring above 200.
+GROUP_WIN_RATE = float(os.getenv("GROUP_WIN_RATE", "0.47"))  # the starting win chance for any game
+OPP_MAX = 0.08        # known opponents' ranks / K/D can move the win chance by at most ±8%
+RANDOM_ACS = 213.0    # average ACS of the random teammates Valorant adds (measured in the group's games)
+ACS_SD = 0.50         # typical game-to-game spread of a player's ACS, as a share of their average
 SD_PRIOR = 4          # a measured ACS spread counts as if it also had this many "typical" games
 SIMS = 20000          # top-frag simulations
 CROWD_WEIGHT = float(os.getenv("CROWD_WEIGHT", "4000"))  # coins of betting that move the odds halfway
@@ -66,7 +72,7 @@ def recent_form(riot: str, details: list[MatchDetail]) -> dict | None:
         "team_tier": _avg(g["team_tier"] for g in games), "opp_tier": _avg(g["opp_tier"] for g in games),
         "rank": next((g["rank"] for g in games if tier_index(g["rank"])), None),  # latest known rank
         "maps": _map_records((g["map"], g["won"]) for g in games),
-        "source": "tracker.gg",
+        "source": "scoreboards",
     }
 
 
@@ -96,7 +102,7 @@ def _map_records(pairs) -> dict:
 
 def history_form(games: list[dict]) -> dict | None:
     """Recent form from the games the bot itself watched through Discord status (newest first), for
-    when tracker.gg isn't available: record, streak and per-map record, but no K/D or ACS."""
+    when no scoreboards load: record, streak and per-map record, but no K/D or ACS."""
     games = [g for g in games if g["outcome"] in ("win", "loss")][:FORM_GAMES * 2]
     if not games:
         return None
@@ -135,22 +141,18 @@ def map_edge(map_record: list[int] | None, overall_pct: float) -> float:
 
 def win_probability(host: PlayerStats, team: list[PlayerStats], opps: list[PlayerStats],
                     form: dict | None = None, map_record: list[int] | None = None) -> float:
-    """Chance the host's team wins a full game (first to 13)."""
+    """Chance the host's team wins a full game (first to 13), before the group's own win rate is applied.
+    Only the opponents (when the Overwolf app names them) move it: replaying the group's past games showed the
+    player's win rate, streak and map record predicted nothing, so `form` and `map_record` are no longer used."""
     p = 0.5
-    overall = shrunk_win_pct(host.win_pct, host.matches)
-    p += (overall - 50) / 100 * 0.5
-    p += map_edge(map_record, overall)
     if opps:
+        edge = 0.0
         t_tier, o_tier = _avg(s.tier for s in team), _avg(s.tier for s in opps)
         if t_tier and o_tier:
-            p += (t_tier - o_tier) * 0.035
-        p += ((_avg(s.kd for s in team) or 1.0) - (_avg(s.kd for s in opps) or 1.0)) * 0.25
-    elif form and form["team_tier"] and form["opp_tier"]:
-        # No opponents given: lean on how their recent lobbies have looked.
-        p += (form["team_tier"] - form["opp_tier"]) * 0.02
-    if form and abs(form["streak"]) >= 2:  # hot or cold streak: up to ±5%
-        p += min(abs(form["streak"]) - 1, 4) * 0.0125 * (1 if form["streak"] > 0 else -1)
-    return min(max(p, 0.15), 0.85)
+            edge += (t_tier - o_tier) * 0.035
+        edge += ((_avg(s.kd for s in team) or 1.0) - (_avg(s.kd for s in opps) or 1.0)) * 0.25
+        p += min(max(edge, -OPP_MAX), OPP_MAX)
+    return p
 
 
 def first_to(q: float, n: int) -> float:
@@ -219,7 +221,7 @@ def topfrag_chances(players: list[tuple[float, float]], unknown: int, seed: int 
     """Chance each player (ACS average, spread) has the team's highest ACS, by simulating the game many
     times. The last entry is the chance it's one of the `unknown` average teammates."""
     rng = random.Random(seed)  # fixed seed: the same lineup always gets the same odds
-    field = players + [(200.0, ACS_SD * 200)] * unknown
+    field = players + [(RANDOM_ACS, ACS_SD * RANDOM_ACS)] * unknown
     wins = [0] * len(field)
     for _ in range(SIMS):
         draws = [rng.gauss(m, s) for m, s in field]
@@ -235,7 +237,8 @@ def build_markets(host: PlayerStats, team: list[PlayerStats], opps: list[PlayerS
     Pass stats already blended with recent form, plus the host's form for streak/lobby adjustments,
     the mode (short modes are closer to 50/50), their record on this map, the self-tuning fit, and each
     player's recent form by Riot ID (how much their ACS swings)."""
-    p_raw = for_mode(win_probability(host, team, opps, form, map_record), mode)
+    p_raw = for_mode(win_probability(host, team, opps, form, map_record), mode) + (GROUP_WIN_RATE - 0.5)
+    p_raw = min(max(p_raw, 0.15), 0.85)
     p_win = calibrate(p_raw, cal)
     known, seen = [], set()
     forms = {k.casefold(): v for k, v in (forms or {}).items()}
@@ -256,18 +259,6 @@ def build_markets(host: PlayerStats, team: list[PlayerStats], opps: list[PlayerS
             "topfrag": options}
 
 
-def win_market(win_pct: float, games: int) -> dict:
-    """Win/Loss only, priced from a win rate (Overwatch: their career-profile record), pulled towards 50%
-    when it comes from few games."""
-    p = min(max(0.5 + (shrunk_win_pct(win_pct, games) - 50) / 100 * 0.5, 0.15), 0.85)
-    return {"win": {"p": p, "p_model": p, "p_raw": p, "win": price(p), "loss": price(1 - p)}, "topfrag": []}
-
-
-def even_win_market() -> dict:
-    """Win/Loss only at even odds (Overwatch: no stats to price from, no top-frag bet)."""
-    return {"win": {"p": 0.5, "p_model": 0.5, "win": price(0.5), "loss": price(0.5)}, "topfrag": []}
-
-
 def _pull(model: float, share: float, staked: float) -> float:
     """Move a model chance towards the share of money bet on it, by at most CROWD_MAX."""
     p = (model * CROWD_WEIGHT + share * staked) / (CROWD_WEIGHT + staked)
@@ -286,15 +277,18 @@ def reprice(markets: dict, bets: list[dict]) -> dict:
         if b["market"] == "win" and b["side"] in on:
             on[b["side"]] += b["amount"]
     staked = on["win"] + on["loss"]
-    if staked:
-        win["p"] = _pull(model, on["win"] / staked, staked)
-        win["win"], win["loss"] = price(win["p"]), price(1 - win["p"])
+    win["p"] = _pull(model, on["win"] / staked, staked) if staked else model  # no bets (left): model odds
+    win["win"], win["loss"] = price(win["p"]), price(1 - win["p"])
     tf_on = {o["riot"]: 0 for o in out["topfrag"]}
     for b in bets:
         if b["market"] == "topfrag" and b["side"] in tf_on:
             tf_on[b["side"]] += b["amount"]
     tf_staked = sum(tf_on.values())
-    if tf_staked and out["topfrag"]:
+    if not tf_staked:
+        for o in out["topfrag"]:
+            o["p"] = o.get("p_model", o["p"])
+            o["odds"] = price(o["p"])
+    elif out["topfrag"]:
         pulled = [_pull(o.get("p_model", o["p"]), tf_on[o["riot"]] / tf_staked, tf_staked) for o in out["topfrag"]]
         total = sum(pulled) or 1
         for o, p in zip(out["topfrag"], pulled):
@@ -337,13 +331,12 @@ def combo_price(markets: dict, side: str) -> float | None:
 
 
 def bet_label(markets: dict, host_riot: str, market: str, side: str) -> str:
-    host = host_riot.split("#")[0]
     if market == "win":
-        return f"{host}'s team {'wins' if side == 'win' else 'loses'}"
+        return "Win" if side == "win" else "Loss"
     if market == "combo":
         result, riot = split_combo(side)
-        return f"{host}'s team {'wins' if result == 'win' else 'loses'} + {option_name(riot, markets)} top frags"
-    return f"{option_name(side, markets)} top frags"
+        return f"{'Win' if result == 'win' else 'Loss'} + {option_name(riot, markets)} team top frag"
+    return f"{option_name(side, markets)} team top frag"
 
 
 def judge(results: dict, market: str, side: str) -> str | None:
@@ -371,8 +364,8 @@ def judge(results: dict, market: str, side: str) -> str | None:
 
 
 def has_acs(detail: MatchDetail, host: MatchPlayer) -> bool:
-    """Top frag is decided purely by combat score (ACS). Overwolf's scoreboard doesn't include it."""
-    return any(p.score for p in detail.players if p.team == host.team)
+    """Top frag needs a score: Valorant's performance score, or combat score (ACS). Overwolf's scoreboard has neither."""
+    return any(p.score or p.perf for p in detail.players if p.team == host.team)
 
 
 def compute_outcome(detail: MatchDetail, host: MatchPlayer) -> dict:
@@ -384,10 +377,14 @@ def compute_outcome(detail: MatchDetail, host: MatchPlayer) -> dict:
     out = {"won": team_result.won if team_result else None, "team": [p.riot_id for p in team],
            "topfrag_riot": None, "topfrag_acs": None, "topfrag_kills": None, "topfrag_tied": []}
     if has_acs(detail, host):
-        key = lambda p: (p.score, p.kills)
+        # Valorant's own Performance Score (what the end screen shows) when everyone has one; otherwise ACS.
+        use_perf = all(p.perf is not None for p in team)
+        key = (lambda p: (round(p.perf, 2), p.kills)) if use_perf else (lambda p: (p.score, p.kills))
         top = max(team, key=key)
-        out.update(topfrag_riot=top.riot_id, topfrag_acs=round(top.acs) if top.acs else None,
-                   topfrag_kills=top.kills, topfrag_tied=[p.riot_id for p in team if key(p) == key(top)])
+        value = (round(top.perf) if use_perf else round(top.acs) if top.acs else None)
+        out.update(topfrag_riot=top.riot_id, topfrag_acs=value, topfrag_kills=top.kills,
+                   topfrag_metric="performance score" if use_perf else "ACS",
+                   topfrag_tied=[p.riot_id for p in team if key(p) == key(top)])
     return out
 
 

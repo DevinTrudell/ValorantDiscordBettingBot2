@@ -5,7 +5,7 @@ the bot over your home network.
 
 ```
 Gaming PC (Windows)                 Proxmox (<proxmox-ip>)
-  Valorant / Overwatch                └─ LXC container  e.g. <container-ip>
+  Valorant                           └─ LXC container  e.g. <container-ip>
   Overwolf + Valorant Bet Link  ───────→    the bot (service), valbet.db, Overwolf port :8787
 ```
 
@@ -16,7 +16,7 @@ Gaming PC (Windows)                 Proxmox (<proxmox-ip>)
    - Hostname `valbet`; set a root password.
    - Template: `debian-12-standard`.
    - Disk 4 GB, 1 CPU core, 512 MB RAM.
-   - Network: **Static** IPv4, e.g. `<container-ip>/24`, gateway = your router's IP (pick a free address
+   - Network: **Static** IPv4, e.g. `<container-ip>/24`, gateway `<your-router-ip>` (pick a free address
      outside your router's DHCP range, or use DHCP and reserve the address in your router).
    - Tick **Start after created**.
 3. Open the container's **Console** and check it's online: `ping -c 2 discord.com`.
