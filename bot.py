@@ -312,7 +312,7 @@ class BetBot(discord.Client):
                 n = db.cancel_match(m["id"])
                 if n is not None:
                     await self.refresh_market_message(m["id"])
-                    if ch := await self.channel(m["channel_id"]):
+                    if n and (ch := await self.channel(m["channel_id"])):
                         await ch.send(f"↩️ No Quick Play or Competitive games showed up on **{short(m['host_riot'])}**'s "
                                       f"Overwatch profile for that session (Arcade doesn't count), so the {n} bet(s) "
                                       "were refunded in full.", allowed_mentions=discord.AllowedMentions.none())
@@ -701,7 +701,7 @@ class BetBot(discord.Client):
             if n is None:  # already settled/cancelled elsewhere
                 return
             await self.refresh_market_message(m["id"])
-            if ch:
+            if n and ch:
                 why = ("the top frag info never arrived" if m["status"] == "awaiting"
                        else "no session result arrived" if session else "no finished game was found")
                 await ch.send(f"⌛ For **{short(m['host_riot'])}**'s {'session' if session else 'game'}, {why} "
