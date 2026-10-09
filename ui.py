@@ -733,9 +733,13 @@ class GroupSlipView(Card):
             self.tf = None
         is_player = self.user_id in {u for u, _ in db.game_players(m)}  # anyone playing: no betting on a loss
         locked = bool(self.joining)
-        intro = ("Someone already created it, so the pick is set: just choose your coins." if locked else
-                 f"You're creating this game's group bet (one per game; others can join yours). "
-                 f"You have {GROUP_HOLD // 60} minutes.")
+        if locked:  # name the existing pick in words: the greyed-out buttons alone are easy to miss
+            lw, ltf = odds.split_combo(self.joining)
+            pick = f"**{'Win' if lw == 'win' else 'Loss'}** + **{odds.option_name(ltf, mk)}** to team top frag"
+            intro = f"Someone already created it, so the pick is set — {pick}. Just choose your coins."
+        else:
+            intro = (f"You're creating this game's group bet (one per game; others can join yours). "
+                     f"You have {GROUP_HOLD // 60} minutes.")
         out = [T("### 👥 Group bet\n-# Result **and** team top frag, both must hit. Everyone chips into one pool; "
                  f"a bigger pool earns a bonus.\n-# {intro}"), Sep()]
 
