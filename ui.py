@@ -317,23 +317,35 @@ async def open_amount(inter: discord.Interaction, m, market: str, side: str):
 
 
 class TopFragPickView(Card):
-    """The optional team top frag: one row per player (agent + rank icons, chance, odds button).
-    After a Win/Loss bet it also shows that bet's receipt."""
+    """Add a team top frag to your result bet, turning it into a parlay: both must hit, paid at the two
+    odds multiplied. One row per player (agent + rank icons, chance, odds button). Picking one shows an
+    'are you sure?' with the combined payout before it converts your Win/Loss bet."""
 
     def __init__(self, match_id: int, user_id: int, placed: dict | None = None):
         super().__init__(match_id, user_id)
         self.placed = placed
+        self.confirm_riot: str | None = None  # a player is picked; show the parlay confirmation
+        self._placing = False
         self.build()
 
     def accent(self) -> int:
         return GREEN_EDGE if self.placed else GOLD
 
+    def _my_win(self):
+        """The user's pending result (Win/Loss) bets on this game and their combined stake."""
+        wins = [b for b in my_bets(self.match_id, self.user_id) if b["market"] == "win"]
+        return wins, sum(b["amount"] for b in wins)
+
     def items(self) -> list:
         m, mk = self.match(), self.markets()
+        if self.confirm_riot is not None:
+            return self._confirm_items(m, mk)
         out = []
         if self.placed:
             out += [T(f"### ✅ Bet placed\n{bet_line(m, mk, self.placed)}\n-# Balance **{self.balance():,}**"), Sep()]
-        out.append(T("### 🎯 Team top frag · optional\n-# Who gets the highest score on the team?"))
+        out.append(T("### 🎯 Add a team top frag · optional\n-# Make it a **parlay**: keep your Win/Loss stake, "
+                     "but you only win it if this player **also** gets the team's highest score — and it pays a "
+                     "lot more. Tap a player to see the combined payout."))
         ranks = _ranks(m)
         for o in mk.get("topfrag", [])[:5]:
             if o["riot"] == odds.OTHER:
@@ -350,14 +362,62 @@ class TopFragPickView(Card):
                        self.start_over_button()))
         return out
 
+    def _confirm_items(self, m, mk) -> list:
+        riot = self.confirm_riot
+        wins, total = self._my_win()
+        tf = next((o for o in mk["topfrag"] if o["riot"] == riot), None)
+        if not wins or tf is None:  # lineup or bets changed under us: drop back to the list
+            self.confirm_riot = None
+            return self.items()
+        result = wins[0]["side"]
+        win_odds = mk["win"][result]
+        combined = odds.combo_price(mk, odds.combo_side(result, riot)) or win_odds * tf["odds"]
+        name = odds.option_name(riot, mk)
+        lines = [f"### 🎯 Make it a parlay?",
+                 f"-# Your **{total:,} on {'Win' if result == 'win' else 'Loss'}** becomes a parlay with "
+                 f"**{name}** to team top frag — you win **only if both hit**.",
+                 f"# {total:,}  ➜  {int(total * combined):,}",
+                 f"-# ×{win_odds:.2f} (result) × ×{tf['odds']:.2f} ({name}) = **×{combined:.2f}**",
+                 f"-# If {name} doesn't top frag, the bet loses even when the result is right."]
+        if self.error:
+            lines.append(f"⚠️ {self.error}")
+        self.shown = {("combo", odds.combo_side(result, riot)): combined}
+        return [T("\n".join(lines)), Sep(),
+                Row(_b(f"🎯 Yes, parlay it", ButtonStyle.success, self._convert),
+                    _b("Back", callback=self._back))]
+
     async def _skip(self, inter: discord.Interaction):
         self.stop()
         await inter.response.edit_message(view=MyBetsView(self.match_id, self.user_id))
 
     def _pick(self, riot: str):
         async def cb(inter):
-            await inter.response.edit_message(view=AmountView(self.match_id, "topfrag", riot, inter.user.id))
+            wins, _ = self._my_win()
+            if not wins:
+                return await self.show(inter, error="Bet on **Win** or **Loss** first, then add the team top frag.")
+            self.error = None
+            self.confirm_riot = riot
+            await self.show(inter)
         return cb
+
+    async def _back(self, inter: discord.Interaction):
+        self.confirm_riot = None
+        self.error = None
+        await self.show(inter)
+
+    async def _convert(self, inter: discord.Interaction):
+        if self._placing or self.is_finished():
+            return await inter.response.defer()
+        self._placing = True
+        try:
+            placed, balance = inter.client.convert_to_parlay(inter.user.id, self.match_id, self.confirm_riot)
+        except ValueError as e:
+            self._placing = False
+            return await self.show(inter, error=str(e))
+        self.stop()
+        m = self.match()
+        await inter.response.edit_message(view=MyBetsView(self.match_id, self.user_id, title="✅ Parlay placed"))
+        await inter.client.announce_bets(inter.user, m, placed, balance)
 
 
 class MyBetsView(Card):

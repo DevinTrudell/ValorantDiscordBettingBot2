@@ -985,7 +985,7 @@ class BetBot(discord.Client):
             elif market == "combo":
                 result, _ = odds.split_combo(side)
                 existing = next((sd for (mkt, sd) in db.group_pools(db.bets_for_match(match_id)) if mkt == "combo"), None)
-                if existing and existing != side:  # one group bet per game: join it, don't start another
+                if group and existing and existing != side:  # one group bet per game: join it, don't start another
                     raise ValueError(f"This game already has a group bet: **{odds.bet_label(mk, m['host_riot'], market, existing)}**. "
                                      "Press 👥 Join group bet on the post to join it (optional).")
                 price = odds.combo_price(mk, side)
@@ -1016,6 +1016,39 @@ class BetBot(discord.Client):
                  and b["status"] != "refunded"]
         db.update_match(match_id, markets=json.dumps(odds.reprice(mk, crowd)))
         return placed, balance
+
+    def convert_to_parlay(self, user_id: int, match_id: int, riot: str) -> tuple[list[dict], int]:
+        """Turn the user's result (Win/Loss) bet(s) on this game into a single parlay with `riot` as team
+        top frag: both must hit, paid at the two odds multiplied. Refunds the result bets and places one
+        combo for the same total stake. Returns (placed, new balance). Raises ValueError."""
+        m = db.get_match(match_id)
+        if not ui.betting_open(m):
+            raise ValueError("Betting is closed for this match.")
+        mine = [b for b in db.bets_for_match(match_id)
+                if b["user_id"] == user_id and b["status"] == "pending" and b["market"] == "win"]
+        if not mine:
+            raise ValueError("Bet on **Win** or **Loss** first, then add the team top frag.")
+        if any(b["market"] == "combo" for b in db.bets_for_match(match_id)
+               if b["user_id"] == user_id and b["status"] == "pending"):
+            raise ValueError("You've already got a parlay on this game. Start over to change it.")
+        mk = json.loads(m["markets"])
+        if not any(o["riot"] == riot for o in mk.get("topfrag", [])):
+            raise ValueError("That player isn't in this match's top-frag bet.")
+        result = mine[0]["side"]
+        total = sum(b["amount"] for b in mine)
+        for b in mine:  # refund the plain result bets; the parlay replaces them
+            db.cancel_bet(b["id"], user_id)
+        self._reprice(m)
+        side = odds.combo_side(result, riot)
+        price = odds.combo_price(json.loads(db.get_match(match_id)["markets"]), side)
+        if price is None:  # shouldn't happen: put the result bets back so nothing is lost
+            for b in mine:
+                db.place_bet(match_id, user_id, "win", result, b["amount"], b["odds"])
+            self._reprice(m)
+            raise ValueError("Couldn't build that parlay. Your result bet is unchanged.")
+        balance = db.place_bet(match_id, user_id, "combo", side, total, price)
+        self._reprice(db.get_match(match_id))
+        return [{"market": "combo", "side": side, "amount": total, "odds": price, "grp": False}], balance
 
     async def cancel_bet(self, user: discord.abc.User, match_id: int, bet_id: int) -> tuple[dict, int]:
         """Refund one of your own bets while betting is open, re-price the odds, update the post and say so
