@@ -21,8 +21,6 @@ full scoreboard, including every opponent's rank, agent, K/D/A and Performance S
   shown on the recap (`ACE_COINS` to change it).
 - **Odds that learn:** priced from rank, recent form and the group's win rate, with a 5% house edge, and
   recalibrated from the bot's own past predictions (`/accuracy`).
-- **Overwatch session bets:** `/link-overwatch Name#1234` lets friends bet on whether a whole Overwatch
-  session ends with more wins than losses (their Career Profile must be set to Public).
 - **Play money only:** everyone starts with coins, gets a daily top-up, and can check `/balance` and
   `/leaderboard`.
 

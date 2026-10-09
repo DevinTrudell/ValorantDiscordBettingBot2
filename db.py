@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 STARTING_BALANCE = int(os.getenv("STARTING_BALANCE", "1000"))
 DAILY_AMOUNT = int(os.getenv("DAILY_AMOUNT", "50"))
+OVERWATCH = os.getenv("OVERWATCH", "0") == "1"  # Overwatch session bets: off until they're finished
 
 conn = sqlite3.connect(os.getenv("DB_PATH", "valbet.db"), isolation_level=None)
 conn.row_factory = sqlite3.Row

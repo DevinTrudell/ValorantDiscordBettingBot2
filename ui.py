@@ -1010,10 +1010,11 @@ def market_view(m) -> discord.ui.View:
 
 def panel_embed() -> discord.Embed:
     return discord.Embed(
-        title="🎮 Valorant & Overwatch betting",
+        title="🎮 Valorant & Overwatch betting" if db.OVERWATCH else "🎮 Valorant betting",
         description=(
-            "**1.** Players link once: `/link Name#TAG` (Riot ID) and/or `/link-overwatch Name#1234` (BattleTag; "
-            "Overwatch bets are on your whole session).\n"
+            ("**1.** Players link once: `/link Name#TAG` (Riot ID) and/or `/link-overwatch Name#1234` (BattleTag; "
+             "Overwatch bets are on your whole session).\n" if db.OVERWATCH else
+             "**1.** Players link once: `/link Name#TAG` (Riot ID).\n") +
             "**2.** When a linked player's game starts, a **Bets open** post appears here by itself.\n"
             "**3.** Anyone in the server can bet, playing or not: press **Win**, **Loss**, a top fragger or "
             "**👥 Group bet** on that post. Both bets are optional.\n"

@@ -240,7 +240,7 @@ class BetBot(discord.Client):
                 db.update_match(m["id"], scouting=json.dumps(sc))
                 log.info("Overwatch session %s continues: %s relaunched the game", m["id"], name)
             return
-        if AUTO_OPEN and not m:
+        if AUTO_OPEN and db.OVERWATCH and not m:
             await self.open_ow_session(user_id, name)
 
     async def open_ow_session(self, host_id: int, name: str) -> int | None:
@@ -1641,6 +1641,10 @@ async def link_overwatch(inter: discord.Interaction, battletag: str):
         "Discord and your Career Profile **Public**.", ephemeral=True)
 
 
+if not db.OVERWATCH:
+    bot.tree.remove_command("link-overwatch")
+
+
 @bot.tree.command(name="link-for", description="Link a friend's Riot ID / BattleTag for them (server managers)")
 @app_commands.describe(user="Who to link", riot_id="Their Riot ID, e.g. Player#NA1",
                        battletag="Their Overwatch BattleTag, e.g. Player#1234")
@@ -1655,6 +1659,8 @@ async def link_for(inter: discord.Interaction, user: discord.Member, riot_id: st
     rid = parse_riot_id(riot_id) if riot_id else None
     if riot_id and not rid:
         return await inter.response.send_message("That doesn't look like a Riot ID (Name#TAG).", ephemeral=True)
+    if battletag and not db.OVERWATCH:
+        return await inter.response.send_message("Overwatch betting is turned off for now.", ephemeral=True)
     tag = re.sub(r"\s*#\s*", "#", battletag.strip()) if battletag else None
     if tag and not BATTLETAG_RE.match(tag):
         return await inter.response.send_message("That doesn't look like a BattleTag (Name#1234).", ephemeral=True)
@@ -1830,11 +1836,11 @@ def info_guide() -> list[discord.Embed]:
         "**Share my activity** so betting can open for your games. `/unlink` stops it.\n"
         "**Overwolf (optional):** install **HomeAssistant Game Events** from the Overwolf store and paste your "
         "address from `/overwolf-link`. It names every teammate at agent select.\n"
-        "**Overwatch:** `/link-overwatch Name#1234` and set your Career Profile to **Public**. Discord can't see "
-        f"Overwatch matches, so bets are on your **session**: betting opens for {OW_WINDOW:g} minutes when you "
-        "launch Overwatch (Winning or Losing session, ×1.90 each), and pays after you close the game: more Quick "
-        "Play + Competitive wins than losses = winning session, an even record refunds. Results take about 15 "
-        "minutes after closing to show up on Blizzard's profile.\n"
+        + ("**Overwatch:** `/link-overwatch Name#1234` and set your Career Profile to **Public**. Discord can't see "
+           f"Overwatch matches, so bets are on your **session**: betting opens for {OW_WINDOW:g} minutes when you "
+           "launch Overwatch (Winning or Losing session, ×1.90 each), and pays after you close the game: more Quick "
+           "Play + Competitive wins than losses = winning session, an even record refunds. Results take about 15 "
+           "minutes after closing to show up on Blizzard's profile.\n" if db.OVERWATCH else "") +
         "Other commands: `/scout Name#TAG`, `/accuracy`, `/panel` (posts the instructions and sets the betting "
         "channel)."))
     return [how, odds_e, setup]
