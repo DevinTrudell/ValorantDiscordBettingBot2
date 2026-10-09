@@ -28,7 +28,11 @@ full scoreboard, including every opponent's rank, agent, K/D/A and Performance S
 
 ## Screenshots
 
-**Post-game recap** — scoreboard for both teams, ⭐ marks the team top frag:
+**Post-game recap with bets** — Coal's group bet (Win + Toothyyy top frag) hit at ×5.22:
+
+![Post-game recap with bets](docs/screenshots/recap-bets.png)
+
+**Post-game recap for a friend's game** — scoreboard for both teams, ⭐ marks the team top frag:
 
 ![Post-game recap](docs/screenshots/recap.png)
 
