@@ -57,7 +57,7 @@ AUTO_OPEN = os.getenv("AUTO_OPEN", "1") == "1"            # open betting when Di
 # Seconds betting stays open after an automatic open. Round 1 (buy phase + fight) takes ~1.5–2.5 min,
 # so 75 s closes it before the first round can end; a round result in the status closes it even sooner.
 ACE_COINS = int(os.getenv("ACE_COINS", "100"))  # paid to a linked player for each ace (all 5 enemies in one round)
-AUTO_WINDOW = int(os.getenv("AUTO_OPEN_WINDOW_SECONDS", "75")) / 60   # in minutes, as open_match expects
+AUTO_WINDOW = int(os.getenv("AUTO_OPEN_WINDOW_SECONDS", "100")) / 60   # in minutes, as open_match expects
 SCORE_RE = re.compile(r"\b(\d{1,2})\s*[-–:]\s*(\d{1,2})\b")
 AUTO_COOLDOWN = timedelta(minutes=25)                     # one auto-open per player per game
 # Overwatch session bets (see overwatch.py): betting opens when a linked player launches Overwatch and pays on the
