@@ -128,6 +128,7 @@ class MatchPlayer:
     first_bloods: int | None = None
     plants: int | None = None
     defuses: int | None = None
+    aces: int | None = None            # rounds where they killed the whole enemy team (HenrikDev data only)
 
 
 @dataclass

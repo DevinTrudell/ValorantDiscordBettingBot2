@@ -5,6 +5,37 @@ buttons and menus right in Discord. Stats come from the HenrikDev API (tracker.g
 Bets settle on their own once the game shows up in the player's match history, and the bot then posts the
 full scoreboard, including every opponent's rank, agent, K/D/A and Performance Score.
 
+## Features
+
+- **Opens betting by itself** when a linked player's Discord status shows agent select (or the Overwolf app
+  reports a match). Nobody types a command: a **Bets open** post appears in the betting channel.
+- **Bet with buttons:** Win / Loss, team top frag and group bets, each on a private slip that only you see.
+  After a Win/Loss bet you can add a top-frag pick or press **⏭ Skip top frag**.
+- **Closes on its own** once the first round has a result, and posts who bet what.
+- **Post-game recap:** the full scoreboard with agent and rank icons, K/D/A, Performance Score and a ⭐ on
+  the team top frag, plus one line per bettor showing what they won. Posted for every tracked player's game,
+  including games you aren't in.
+- **Pays out instantly:** Win/Loss pays the moment the game ends (from the final score in Discord status);
+  top-frag and group bets pay once the scoreboard is in, or are refunded if it never arrives.
+- **Ace bonus:** any linked player who aces (kills all 5 enemies in one round) gets **100 coins** per ace,
+  shown on the recap (`ACE_COINS` to change it).
+- **Odds that learn:** priced from rank, recent form and the group's win rate, with a 5% house edge, and
+  recalibrated from the bot's own past predictions (`/accuracy`).
+- **Overwatch session bets:** `/link-overwatch Name#1234` lets friends bet on whether a whole Overwatch
+  session ends with more wins than losses (their Career Profile must be set to Public).
+- **Play money only:** everyone starts with coins, gets a daily top-up, and can check `/balance` and
+  `/leaderboard`.
+
+## Screenshots
+
+**Post-game recap** — scoreboard for both teams, ⭐ marks the team top frag:
+
+![Post-game recap](docs/screenshots/recap.png)
+
+**Betting closed** — the game card and who bet what:
+
+![Betting closed](docs/screenshots/betting-closed.png)
+
 ## Bets
 
 | Bet | Options | How it's priced |

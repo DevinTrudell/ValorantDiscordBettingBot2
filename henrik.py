@@ -63,6 +63,17 @@ def to_detail(d: dict) -> MatchDetail | None:
     fb, plants, defuses = {}, {}, {}
     for k in first_kill.values():
         fb[name(k.get("killer"))] = fb.get(name(k.get("killer")), 0) + 1
+    # Aces: one player killing all 5 enemies in the same round
+    victims: dict[tuple[int, str], set[str]] = {}
+    for k in d.get("kills") or []:
+        killer, victim = k.get("killer") or {}, k.get("victim") or {}
+        if k.get("round") is None or (killer.get("team") and killer.get("team") == victim.get("team")):
+            continue
+        victims.setdefault((k["round"], name(killer)), set()).add(name(victim))
+    aces = {}
+    for (_, killer), who in victims.items():
+        if len(who) >= 5:
+            aces[killer] = aces.get(killer, 0) + 1
     for rd in d.get("rounds") or []:
         for key, table in (("plant", plants), ("defuse", defuses)):
             if (rd.get(key) or {}).get("player"):
@@ -81,7 +92,7 @@ def to_detail(d: dict) -> MatchDetail | None:
             acs=score / total_rounds if total_rounds else None, rounds=total_rounds,
             rank=(p.get("tier") or {}).get("name") or "Unranked", party=p.get("party_id"),
             perf=float(perf) if perf is not None else None, first_bloods=fb.get(rid, 0),
-            plants=plants.get(rid, 0), defuses=defuses.get(rid, 0)))
+            plants=plants.get(rid, 0), defuses=defuses.get(rid, 0), aces=aces.get(rid, 0)))
     queue = meta.get("queue") or {}
     return MatchDetail(id=meta.get("match_id") or "?", map=(meta.get("map") or {}).get("name") or "Unknown map",
                        mode=queue.get("name") or queue.get("id") or "?", timestamp=_ts(meta.get("started_at")),

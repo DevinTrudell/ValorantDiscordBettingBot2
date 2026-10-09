@@ -330,8 +330,16 @@ def combo_price(markets: dict, side: str) -> float | None:
     return round(markets["win"][result] * tf, 2)
 
 
+def session_market() -> dict:
+    """Overwatch session bet: more wins than losses this session? Even odds (×1.90 each): a player's win rate
+    didn't predict results in the Valorant backtest, and a session is several games."""
+    return {"win": {"p": 0.5, "p_model": 0.5, "win": price(0.5), "loss": price(0.5)}, "topfrag": [], "session": True}
+
+
 def bet_label(markets: dict, host_riot: str, market: str, side: str) -> str:
     if market == "win":
+        if markets.get("session"):
+            return "Winning session" if side == "win" else "Losing session"
         return "Win" if side == "win" else "Loss"
     if market == "combo":
         result, riot = split_combo(side)

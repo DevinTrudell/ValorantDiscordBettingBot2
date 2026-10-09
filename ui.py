@@ -91,7 +91,7 @@ def _coins(text: str, balance: int | None = None) -> int | None:
 
 # ---------- the private betting screens: one card each (Discord's newer message layout) ----------
 # Every screen is a Card that redraws itself in place after each click. The flow:
-#   Win / Loss  ->  AmountView  ->  TopFragPickView (receipt + optional top frag)  ->  AmountView  ->  MyBetsView
+#   Win / Loss  ->  AmountView  ->  TopFragPickView (receipt + optional top frag, or ⏭ Skip)  ->  AmountView  ->  MyBetsView
 #   ↩ Start over (most screens): refunds all your bets on the game  ->  StartOverView (pick Win / Loss again)
 
 GREEN_EDGE, RED_EDGE = 0x23A55A, 0xF23F43
@@ -346,8 +346,13 @@ class TopFragPickView(Card):
             out.append(discord.ui.Section(
                 T(f"{player_icons(m, mk, o['riot'])} **{odds.option_name(o['riot'], mk)}**\n-# {about}"),
                 accessory=_b(f"×{o['odds']:.2f}", ButtonStyle.primary, self._pick(o["riot"]))))
-        out.append(Row(self.start_over_button()))
+        out.append(Row(*([_b("⏭ Skip top frag", callback=self._skip)] if self.placed else []),
+                       self.start_over_button()))
         return out
+
+    async def _skip(self, inter: discord.Interaction):
+        self.stop()
+        await inter.response.edit_message(view=MyBetsView(self.match_id, self.user_id))
 
     def _pick(self, riot: str):
         async def cb(inter):
@@ -438,8 +443,9 @@ class StartOverView(Card):
         playing = self.user_id in {u for u, _ in db.game_players(m)}
         return [T(f"### ↩ Starting over\n{done}\n-# Balance **{self.balance():,}** · closes {_ts(m['lock_at'])}"),
                 Sep(), T("### Pick again"),
-                Row(_b(f"Win ×{mk['win']['win']:.2f}", ButtonStyle.success, self._pick("win")),
-                    _b(f"Loss ×{mk['win']['loss']:.2f}", ButtonStyle.danger, None if playing else self._pick("loss")))]
+                Row(*[_b(f"{odds.bet_label(mk, m['host_riot'], 'win', side)} ×{mk['win'][side]:.2f}", style,
+                         None if playing and side == "loss" else self._pick(side))
+                      for side, style in (("win", ButtonStyle.success), ("loss", ButtonStyle.danger))])]
 
     def _pick(self, side: str):
         async def cb(inter):
@@ -979,8 +985,9 @@ def market_rows(m) -> list:
         extra.append(SlipButton(m["id"], "group", "👥 Join group bet" if joinable else "👥 Group bet",
                                 ButtonStyle.success if joinable else ButtonStyle.secondary))
     extra.append(CancelBetsButton(m["id"]))
-    return [Row(SlipButton(m["id"], "win", f"Win ×{mk['win']['win']:.2f}", ButtonStyle.success),
-                SlipButton(m["id"], "loss", f"Loss ×{mk['win']['loss']:.2f}", ButtonStyle.danger)),
+    label = lambda side: f"{odds.bet_label(mk, m['host_riot'], 'win', side)} ×{mk['win'][side]:.2f}"
+    return [Row(SlipButton(m["id"], "win", label("win"), ButtonStyle.success),
+                SlipButton(m["id"], "loss", label("loss"), ButtonStyle.danger)),
             Row(*extra)]
 
 
@@ -1003,9 +1010,10 @@ def market_view(m) -> discord.ui.View:
 
 def panel_embed() -> discord.Embed:
     return discord.Embed(
-        title="🎮 Valorant betting",
+        title="🎮 Valorant & Overwatch betting",
         description=(
-            "**1.** Players link once: `/link Name#TAG` (Riot ID).\n"
+            "**1.** Players link once: `/link Name#TAG` (Riot ID) and/or `/link-overwatch Name#1234` (BattleTag; "
+            "Overwatch bets are on your whole session).\n"
             "**2.** When a linked player's game starts, a **Bets open** post appears here by itself.\n"
             "**3.** Anyone in the server can bet, playing or not: press **Win**, **Loss**, a top fragger or "
             "**👥 Group bet** on that post. Both bets are optional.\n"

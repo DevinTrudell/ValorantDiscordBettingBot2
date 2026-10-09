@@ -35,6 +35,7 @@ import dashboard
 import db
 import henrik
 import odds
+import overwatch as ow
 import ui
 import icons
 import overwolf_data
@@ -55,9 +56,18 @@ PRESENCE_LOG = "presence_log.jsonl"
 AUTO_OPEN = os.getenv("AUTO_OPEN", "1") == "1"            # open betting when Discord shows a match starting
 # Seconds betting stays open after an automatic open. Round 1 (buy phase + fight) takes ~1.5–2.5 min,
 # so 75 s closes it before the first round can end; a round result in the status closes it even sooner.
+ACE_COINS = int(os.getenv("ACE_COINS", "100"))  # paid to a linked player for each ace (all 5 enemies in one round)
 AUTO_WINDOW = int(os.getenv("AUTO_OPEN_WINDOW_SECONDS", "75")) / 60   # in minutes, as open_match expects
 SCORE_RE = re.compile(r"\b(\d{1,2})\s*[-–:]\s*(\d{1,2})\b")
 AUTO_COOLDOWN = timedelta(minutes=25)                     # one auto-open per player per game
+# Overwatch session bets (see overwatch.py): betting opens when a linked player launches Overwatch and pays on the
+# whole session's record once they've closed it and their career profile has caught up.
+OW_WINDOW = int(os.getenv("OVERWATCH_WINDOW_SECONDS", "180")) / 60  # minutes betting stays open after launch
+OW_CLOSED_AFTER = timedelta(minutes=2)    # Overwatch gone from their status this long = they closed the game
+OW_REOPEN = timedelta(minutes=10)         # relaunching within this long after closing continues the same session
+OW_SETTLE_AFTER = timedelta(minutes=15)   # wait this long after closing (profile + stats-service cache lag)
+OW_POLL = timedelta(minutes=3)            # how often to check the profile once they've closed the game
+OW_TIMEOUT = timedelta(hours=float(os.getenv("OVERWATCH_SESSION_HOURS", "10")))  # refund if no result by then
 
 # What Valorant's Discord status says in each phase. Exact wording isn't documented, so these are
 # deliberately broad; presence_log.jsonl records the real text so they can be tightened later.
@@ -170,12 +180,21 @@ class BetBot(discord.Client):
         self.last_score: dict[int, tuple[int, int, str]] = {}  # discord_id -> (ours, theirs, status text)
         self._timers: set[asyncio.Task] = set()  # pending "close betting" timers
         self._polled: dict[int, datetime] = {}      # match_id -> last finished-match check (Valorant)
+        self.ow = ow.OverwatchClient()
+        self.ow_playing: dict[int, bool] = {}       # discord_id -> Discord shows them in Overwatch
+        self.ow_gone: dict[int, datetime] = {}      # discord_id -> when Overwatch left their status
 
     # ---------- Discord status tracking (experiment: can we see when a match starts?) ----------
 
     async def on_presence_update(self, before: discord.Member, after: discord.Member):
-        if not db.is_linked(after.id):  # only players who opted in with /link
+        if not db.is_linked(after.id):  # only players who opted in with /link or /link-overwatch
             return
+        if db.linked_battletag(after.id):
+            in_ow = any("overwatch" in (getattr(a, "name", "") or "").lower() for a in after.activities)
+            try:
+                await self.overwatch_presence(after.id, after.display_name, in_ow)
+            except Exception:
+                log.exception("Overwatch session update failed for %s", after.display_name)
         acts = [activity_dict(a) for a in after.activities if "valorant" in (getattr(a, "name", "") or "").lower()]
         prev = self.presence.get(after.id)
         if prev and prev["activities"] == acts:
@@ -200,6 +219,109 @@ class BetBot(discord.Client):
         last = db.recent_matches(1)
         cid = db.get_meta("panel_channel") or (last[0]["channel_id"] if last else None)
         return int(cid) if cid else None
+
+    # ---------- Overwatch session bets (Discord status + career profile; see overwatch.py) ----------
+
+    async def overwatch_presence(self, user_id: int, name: str, playing: bool):
+        """Discord shows Overwatch starting or stopping for someone with a linked BattleTag."""
+        was = self.ow_playing.get(user_id, False)
+        self.ow_playing[user_id] = playing
+        if playing:
+            self.ow_gone.pop(user_id, None)
+        elif was:
+            self.ow_gone[user_id] = now()
+        if not (playing and not was):
+            return
+        m = db.active_match_for_host(user_id)
+        if m and m["game"] == "overwatch":  # relaunched soon after closing: it's the same session
+            sc = json.loads(m["scouting"])
+            if sc.get("closed_at") and now() - datetime.fromisoformat(sc["closed_at"]) < OW_REOPEN:
+                sc.pop("closed_at")
+                db.update_match(m["id"], scouting=json.dumps(sc))
+                log.info("Overwatch session %s continues: %s relaunched the game", m["id"], name)
+            return
+        if AUTO_OPEN and not m:
+            await self.open_ow_session(user_id, name)
+
+    async def open_ow_session(self, host_id: int, name: str) -> int | None:
+        """Snapshot their Quick Play + Competitive totals and open session betting."""
+        linked = db.linked_battletag(host_id)
+        if not linked or host_id in self._opening or db.active_match_for_host(host_id):
+            return None
+        tag, ow_id = linked
+        channel_id = self.betting_channel_id()
+        ch = await self.channel(channel_id) if channel_id else None
+        if not ch:
+            log.info("Overwatch session skipped for %s: run /panel first", name)
+            return None
+        self._opening.add(host_id)
+        try:
+            try:
+                if not ow_id:  # linked before the profile was public: try to find it now
+                    ow_id = await self.ow.find_player(tag)
+                    db.set_battletag(host_id, tag, ow_id)
+                recs = await self.ow.records(ow_id)
+            except ow.OverwatchError as e:
+                log.info("Overwatch session skipped for %s: %s", name, e)
+                return None
+            if db.active_match_for_host(host_id):
+                return None
+            opened = now()
+            match_id = db.create_match(
+                guild_id=int(GUILD_ID or 0), channel_id=channel_id, opener_id=self.user.id, host_id=host_id,
+                host_riot=tag, mode="session", status="open", game="overwatch",
+                opened_at=opened.isoformat(), lock_at=(opened + timedelta(minutes=OW_WINDOW)).isoformat(),
+                baseline_match_id=None, markets=odds.session_market(),
+                scouting={"host": PlayerStats(riot_id=tag).to_dict(), "ow_id": ow_id,
+                          "ow_baseline": ow.snapshot(recs), "ow_record": ow.snapshot({"all": ow.total(recs)})["all"]})
+        finally:
+            self._opening.discard(host_id)
+        try:
+            await self._post_bets_open(match_id, ch)
+        except ValueError as e:
+            log.warning("Couldn't post Overwatch bets for %s: %s", name, e)
+            return None
+        log.info("Opened Overwatch session %s for %s", match_id, name)
+        return match_id
+
+    async def check_ow_session(self, m):
+        """Once they've closed Overwatch and the profile has caught up: pay on the session's record."""
+        sc = json.loads(m["scouting"])
+        host = m["host_id"]
+        if not sc.get("closed_at"):
+            gone = self.ow_gone.get(host)
+            if self.ow_playing.get(host) or not gone or now() - gone < OW_CLOSED_AFTER:
+                return
+            sc["closed_at"] = gone.isoformat()
+            db.update_match(m["id"], scouting=json.dumps(sc))
+            log.info("Overwatch session %s: game closed at %s", m["id"], sc["closed_at"])
+        closed = datetime.fromisoformat(sc["closed_at"])
+        last = self._polled.get(m["id"])
+        if now() - closed < OW_SETTLE_AFTER or (last and now() - last < OW_POLL):
+            return
+        if m["status"] == "open":  # closed the game while betting was still open: lock first
+            return
+        self._polled[m["id"]] = now()
+        try:
+            wins, losses, games = ow.session_result(sc["ow_baseline"], await self.ow.records(sc["ow_id"]))
+        except ow.OverwatchError as e:
+            log.warning("Overwatch session %s: %s", m["id"], e)
+            return
+        if not games:  # the profile hasn't caught up yet, or they only played Arcade / customs
+            if now() - closed > timedelta(hours=2):
+                n = db.cancel_match(m["id"])
+                if n is not None:
+                    await self.refresh_market_message(m["id"])
+                    if ch := await self.channel(m["channel_id"]):
+                        await ch.send(f"↩️ No Quick Play or Competitive games showed up on **{short(m['host_riot'])}**'s "
+                                      f"Overwatch profile for that session (Arcade doesn't count), so the {n} bet(s) "
+                                      "were refunded in full.", allowed_mentions=discord.AllowedMentions.none())
+            return
+        log.info("Overwatch session %s: %d games, %d-%d", m["id"], games, wins, losses)
+        draws = games - wins - losses
+        score = f"{wins}–{losses}" + (f"–{draws}" if draws else "")
+        await self.pay_result(m, await self.display_name(host), None if wins == losses else wins > losses,
+                              f"{score} in {games} game{'s' if games != 1 else ''}")
 
     # ---------- live game data from the Overwolf app ----------
 
@@ -499,6 +621,7 @@ class BetBot(discord.Client):
     async def close(self):
         await self.tracker.close()
         await self.henrik.close()
+        await self.ow.close()
         await super().close()
 
     async def on_guild_join(self, guild: discord.Guild):
@@ -511,6 +634,16 @@ class BetBot(discord.Client):
         if not getattr(self, "_icons_started", False):  # rank/agent icons as the bot's own emojis (once)
             self._icons_started = True
             asyncio.create_task(icons.ensure(self))
+        # Overwatch after a restart: who's in it right now (no new session for them: it may already be running),
+        # and open sessions whose player has since closed the game.
+        for g in self.guilds:
+            for member in g.members:
+                if db.linked_battletag(member.id):
+                    self.ow_playing[member.id] = any("overwatch" in (getattr(a, "name", "") or "").lower()
+                                                     for a in member.activities)
+        for m in db.active_matches():
+            if m["game"] == "overwatch" and not self.ow_playing.get(m["host_id"]):
+                self.ow_gone.setdefault(m["host_id"], now())
 
     async def channel(self, channel_id: int) -> discord.abc.Messageable | None:
         try:
@@ -558,18 +691,26 @@ class BetBot(discord.Client):
             if ch:
                 await self.post_bets_closed(m, ch)
 
-        if now() - opened > MATCH_TIMEOUT:
+        session = m["game"] == "overwatch"
+        timeout = OW_TIMEOUT if session else MATCH_TIMEOUT
+        if now() - opened > timeout:
+            if m["status"] == "awaiting" and not any(b["status"] == "pending" for b in db.bets_for_match(m["id"])):
+                db.update_match(m["id"], status="resolved")  # everything's paid; only the recap never arrived
+                return
             n = db.cancel_match(m["id"])
             if n is None:  # already settled/cancelled elsewhere
                 return
             await self.refresh_market_message(m["id"])
             if ch:
                 why = ("the top frag info never arrived" if m["status"] == "awaiting"
-                       else "no finished game was found")
-                await ch.send(f"⌛ For **{short(m['host_riot'])}**'s game, {why} within "
-                              f"{MATCH_TIMEOUT.total_seconds() / 3600:g} h, so the {n} bet(s) still on hold were "
-                              "refunded in full. The coins are back in everyone's balance.")
+                       else "no session result arrived" if session else "no finished game was found")
+                await ch.send(f"⌛ For **{short(m['host_riot'])}**'s {'session' if session else 'game'}, {why} "
+                              f"within {timeout.total_seconds() / 3600:g} h, so the {n} bet(s) still on hold were "
+                              "refunded in full. The coins are back in everyone's balance.",
+                              allowed_mentions=discord.AllowedMentions.none())
             return
+        if session:
+            return await self.check_ow_session(m)
 
         if now() - opened < MIN_GAME_TIME:
             return
@@ -936,6 +1077,16 @@ class BetBot(discord.Client):
             except discord.HTTPException as e:
                 log.warning("Couldn't update the post for match %s: %s", m["id"], e)
 
+    @staticmethod
+    def pay_aces(detail: MatchDetail) -> list[tuple[int, int]]:
+        """ACE_COINS per ace to every linked player who got one this game: [(discord_id, coins)], once per game."""
+        payouts = [(uid, p.aces * ACE_COINS) for p in detail.players
+                   if p.aces and (uid := db.riot_owner(p.riot_id))]
+        if not payouts or not ACE_COINS or not db.pay_aces(detail.id, payouts):
+            return []
+        log.info("Ace bonus for match %s: %s", detail.id, payouts)
+        return payouts
+
     async def settle(self, m, detail: MatchDetail):
         m = db.get_match(m["id"])  # the caller's row may be stale
         if not m or m["status"] not in ("open", "locked", "awaiting"):
@@ -963,6 +1114,7 @@ class BetBot(discord.Client):
                     p.riot_id = o["riot"]
         outcome = odds.compute_outcome(detail, host)
         results = odds.settle(markets, outcome)
+        aces = []
         judge = lambda market, side: odds.judge(results, market, side)
         db.set_outcome(m["id"], results["win"])
         if results["topfrag"] is None:
@@ -979,11 +1131,12 @@ class BetBot(discord.Client):
             bets = db.settle_match(m["id"], judge, detail.id, {"outcome": outcome, "results": results})
             if bets is None:
                 return
+            aces = self.pay_aces(detail)
         await self.refresh_market_message(m["id"])
         if ch:
             if detail.map in ("", "Unknown map") and (known := json.loads(m["scouting"]).get("map")):
                 detail.map = known  # the Overwolf app didn't send the map: Discord's status had it
-            [e] = result_embeds(m, markets, detail, host, outcome, results, bets)
+            [e] = result_embeds(m, markets, detail, host, outcome, results, bets, aces)
             await self.post_result(m, ch, e)  # replaces the end-of-game message: the whole post-game is one box
 
 
@@ -1114,15 +1267,25 @@ def markets_view(m, bets=None) -> discord.ui.LayoutView:
     where = " · ".join(x for x in ((m["mode"] or "").title() if m["mode"] != "any" else "",
                                    scouting.get("map") or "") if x)
     is_open = ui.betting_open(m)
+    session = bool(mk.get("session"))
+    if session:  # Overwatch: one bet on the whole session
+        players = f"{players}'s Overwatch session"
+        where = "Quick Play + Competitive"
     if is_open:
         head = f"## 🎲 {players}" + (f"\n-# {where}" if where else "")
     else:
-        state = {"locked": "game on", "resolved": "settled", "cancelled": "cancelled",
+        state = {"locked": "session on" if session else "game on", "resolved": "settled", "cancelled": "cancelled",
                  "awaiting": "result paid"}.get(m["status"], "betting closed")
         icon = {"cancelled": "🚫", "resolved": "🏁", "awaiting": "🏁"}.get(m["status"], "🔒")
         head = f"## {icon} {players}\n-# " + " · ".join(x for x in (where, state) if x)
     lines = []
-    if is_open:
+    if session and is_open:
+        rec = scouting.get("ow_record")
+        lines.append("Will they **win more games than they lose** before closing Overwatch? Pays when they close "
+                     "the game; an even record refunds. Arcade doesn't count.")
+        if rec and rec[0]:
+            lines.append(f"📊 Career: **{rec[1]:,}–{rec[2]:,}** ({rec[1] / rec[0] * 100:.0f}% wins)")
+    elif is_open:
         p = mk["win"]["p"]
         filled = round(p * 10)
         lines.append(f"{'🟩' * filled}{'⬛' * (10 - filled)}  **{p * 100:.0f}%** win chance")
@@ -1227,10 +1390,10 @@ HELD_NOTE = (f"waiting for the final scoreboard (with ACS) for top frag, which h
              "if it never does.")
 
 
-def result_embeds(m, markets, detail: MatchDetail, host, outcome, results, bets) -> list[discord.Embed]:
-    """The whole post-game in one box: scoreboard, top frag, then one line per bettor."""
+def result_embeds(m, markets, detail: MatchDetail, host, outcome, results, bets, aces=None) -> list[discord.Embed]:
+    """The whole post-game in one box: scoreboard, top frag, aces, then one line per bettor."""
     board = scoreboard_embed(detail, host, outcome)  # ⭐ on the scoreboard marks the team top frag
-    notes = []
+    notes = [f"💥 **Ace{'s' if coins > ACE_COINS else ''}!** <@{uid}> **+{coins:,}** coins" for uid, coins in aces or []]
     if results["topfrag"] is None:
         notes.append("⏳ Final scores coming in a minute")
     elif results["topfrag"] == "push":
@@ -1245,8 +1408,12 @@ def result_embeds(m, markets, detail: MatchDetail, host, outcome, results, bets)
 
 def pending_result_embed(m, player: str, won: bool | None, score: str, map_name: str | None) -> discord.Embed:
     """Win/Loss paid from the final score; the scoreboard (top frag) replaces this message when it arrives."""
-    verdict = "Victory" if won else "Defeat" if won is False else "Draw"
-    title = " · ".join(x for x in (game_names(m) or player, map_name, f"{score} {verdict}".strip()) if x)
+    if m["game"] == "overwatch":
+        verdict = "Winning session" if won else "Losing session" if won is False else "Even session (refunded)"
+        title = f"{game_names(m) or player}'s Overwatch session · {score} · {verdict}"
+    else:
+        verdict = "Victory" if won else "Defeat" if won is False else "Draw"
+        title = " · ".join(x for x in (game_names(m) or player, map_name, f"{score} {verdict}".strip()) if x)
     lines = []
     if json.loads(m["markets"]).get("topfrag") and m["status"] != "resolved":
         lines.append("⏳ Scoreboard coming in a minute")
@@ -1445,22 +1612,73 @@ def rank_line(riot_id: str, s: PlayerStats | None) -> str:
     return f"{icons.rank(s.rank, fallback=False)} **{riot_id}** · {s.rank}{record}"
 
 
-@bot.tree.command(name="link-for", description="Link a friend's Riot ID for them (server managers)")
-@app_commands.describe(user="Who to link", riot_id="Their Riot ID, e.g. Player#NA1")
+BATTLETAG_RE = re.compile(r"^[^\s#@<>`]{2,12}#\d{3,6}$")
+
+
+@bot.tree.command(name="link-overwatch", description="Link your Overwatch BattleTag (Name#1234) for session bets")
+@app_commands.describe(battletag="Your BattleTag, e.g. Player#1234")
+async def link_overwatch(inter: discord.Interaction, battletag: str):
+    tag = re.sub(r"\s*#\s*", "#", battletag.strip())
+    if not BATTLETAG_RE.match(tag):
+        return await inter.response.send_message("That doesn't look like a BattleTag (Name#1234).", ephemeral=True)
+    if (owner := db.battletag_owner(tag)) and owner != inter.user.id:
+        return await inter.response.send_message("That BattleTag is already linked to another Discord account.",
+                                                 ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    try:
+        ow_id = await bot.ow.find_player(tag)
+        both = ow.total(await bot.ow.records(ow_id))
+    except ow.OverwatchError as e:
+        db.set_battletag(inter.user.id, tag)
+        return await inter.followup.send(
+            f"Linked to **{tag}**, but the bot can't read the Overwatch profile yet: {e}. It tries again each time "
+            "you launch Overwatch.", ephemeral=True)
+    db.set_battletag(inter.user.id, tag, ow_id)
+    await inter.followup.send(
+        f"Linked to **{tag}**: {both.won:,}–{both.lost:,} in Quick Play + Competitive ({both.win_pct:.0f}% wins).\n"
+        "When Discord shows you launching Overwatch, betting opens on your **session**: more wins than losses "
+        "before you close the game? It pays out after you close Overwatch. Keep **Share my activity** on in "
+        "Discord and your Career Profile **Public**.", ephemeral=True)
+
+
+@bot.tree.command(name="link-for", description="Link a friend's Riot ID / BattleTag for them (server managers)")
+@app_commands.describe(user="Who to link", riot_id="Their Riot ID, e.g. Player#NA1",
+                       battletag="Their Overwatch BattleTag, e.g. Player#1234")
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.guild_only()
-async def link_for(inter: discord.Interaction, user: discord.Member, riot_id: str):
+async def link_for(inter: discord.Interaction, user: discord.Member, riot_id: str | None = None,
+                   battletag: str | None = None):
     if user.bot:
         return await inter.response.send_message("Bots can't be linked.", ephemeral=True)
-    rid = parse_riot_id(riot_id)
-    if not rid:
+    if not riot_id and not battletag:
+        return await inter.response.send_message("Give a Riot ID, a BattleTag, or both.", ephemeral=True)
+    rid = parse_riot_id(riot_id) if riot_id else None
+    if riot_id and not rid:
         return await inter.response.send_message("That doesn't look like a Riot ID (Name#TAG).", ephemeral=True)
-    if (owner := db.riot_owner(rid)) and owner != user.id:
+    tag = re.sub(r"\s*#\s*", "#", battletag.strip()) if battletag else None
+    if tag and not BATTLETAG_RE.match(tag):
+        return await inter.response.send_message("That doesn't look like a BattleTag (Name#1234).", ephemeral=True)
+    if rid and (owner := db.riot_owner(rid)) and owner != user.id:
         return await inter.response.send_message("That Riot ID is already linked to another Discord account.",
                                                  ephemeral=True)
-    db.set_riot_id(user.id, rid)
-    await inter.response.send_message(
-        f"Linked {user.mention}: Riot ID **{rid}**\nThey can change it with /link or remove it with /unlink.",
+    if tag and (owner := db.battletag_owner(tag)) and owner != user.id:
+        return await inter.response.send_message("That BattleTag is already linked to another Discord account.",
+                                                 ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    notes = []
+    if rid:
+        db.set_riot_id(user.id, rid)
+        notes.append(f"Riot ID **{rid}**")
+    if tag:
+        try:
+            ow_id = await bot.ow.find_player(tag)
+            db.set_battletag(user.id, tag, ow_id)
+            notes.append(f"BattleTag **{tag}**")
+        except ow.OverwatchError as e:
+            db.set_battletag(user.id, tag)
+            notes.append(f"BattleTag **{tag}** (profile not readable yet: {e})")
+    await inter.followup.send(
+        f"Linked {user.mention}: " + " · ".join(notes) + "\nThey can change it with /link or remove it with /unlink.",
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
@@ -1612,6 +1830,11 @@ def info_guide() -> list[discord.Embed]:
         "**Share my activity** so betting can open for your games. `/unlink` stops it.\n"
         "**Overwolf (optional):** install **HomeAssistant Game Events** from the Overwolf store and paste your "
         "address from `/overwolf-link`. It names every teammate at agent select.\n"
+        "**Overwatch:** `/link-overwatch Name#1234` and set your Career Profile to **Public**. Discord can't see "
+        f"Overwatch matches, so bets are on your **session**: betting opens for {OW_WINDOW:g} minutes when you "
+        "launch Overwatch (Winning or Losing session, ×1.90 each), and pays after you close the game: more Quick "
+        "Play + Competitive wins than losses = winning session, an even record refunds. Results take about 15 "
+        "minutes after closing to show up on Blizzard's profile.\n"
         "Other commands: `/scout Name#TAG`, `/accuracy`, `/panel` (posts the instructions and sets the betting "
         "channel)."))
     return [how, odds_e, setup]

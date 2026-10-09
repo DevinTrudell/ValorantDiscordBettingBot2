@@ -73,7 +73,7 @@ conn.executescript(
 for _table, _col, _ddl in (("users", "battletag", "TEXT"), ("matches", "game", "TEXT NOT NULL DEFAULT 'valorant'"),
                            ("matches", "outcome", "TEXT"),  # win | loss | push, for checking the odds afterwards
                            ("bets", "grp", "INTEGER NOT NULL DEFAULT 0"),  # 1 = part of a group pool
-                           ("users", "ow_id", "TEXT")):  # (battletag / ow_id: unused, left from Overwatch support)
+                           ("users", "ow_id", "TEXT")):  # Blizzard player ID for the linked BattleTag
     if _col not in {r[1] for r in conn.execute(f"PRAGMA table_info({_table})")}:
         conn.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} {_ddl}")
 
@@ -175,10 +175,30 @@ def riot_owner(riot_id: str) -> int | None:
     return None
 
 
+def battletag_owner(battletag: str) -> int | None:
+    """Discord ID that has this Overwatch BattleTag linked (case-insensitive)."""
+    want = battletag.casefold()
+    for discord_id, tag in conn.execute("SELECT discord_id, battletag FROM users WHERE battletag IS NOT NULL"):
+        if tag.casefold() == want:
+            return discord_id
+    return None
+
+
+def set_battletag(discord_id: int, battletag: str, ow_id: str | None = None):
+    get_user(discord_id)
+    conn.execute("UPDATE users SET battletag = ?, ow_id = ? WHERE discord_id = ?", (battletag, ow_id, discord_id))
+
+
+def linked_battletag(discord_id: int) -> tuple[str, str | None] | None:
+    """(BattleTag, Blizzard player ID or None) if this user linked Overwatch, without creating a user row."""
+    row = conn.execute("SELECT battletag, ow_id FROM users WHERE discord_id = ?", (discord_id,)).fetchone()
+    return (row[0], row[1]) if row and row[0] else None
+
+
 def is_linked(discord_id: int) -> bool:
-    """Has a Riot ID linked (the bot only follows the games of people who opted in)."""
-    row = conn.execute("SELECT riot_id FROM users WHERE discord_id = ?", (discord_id,)).fetchone()
-    return bool(row and row[0])
+    """Has a Riot ID or BattleTag linked (the bot only follows the games of people who opted in)."""
+    row = conn.execute("SELECT riot_id, battletag FROM users WHERE discord_id = ?", (discord_id,)).fetchone()
+    return bool(row and (row[0] or row[1]))
 
 
 def set_riot_id(discord_id: int, riot_id: str):
@@ -187,9 +207,9 @@ def set_riot_id(discord_id: int, riot_id: str):
 
 
 def unlink(discord_id: int) -> bool:
-    """Forget someone's Riot ID (balance and bets stay). False if nothing was linked."""
-    return conn.execute("UPDATE users SET riot_id = NULL WHERE discord_id = ? AND riot_id IS NOT NULL",
-                        (discord_id,)).rowcount == 1
+    """Forget someone's Riot ID and BattleTag (balance and bets stay). False if nothing was linked."""
+    return conn.execute("UPDATE users SET riot_id = NULL, battletag = NULL, ow_id = NULL WHERE discord_id = ? "
+                        "AND (riot_id IS NOT NULL OR battletag IS NOT NULL)", (discord_id,)).rowcount == 1
 
 
 def transfer(src: int, dst: int, amount: int):
@@ -229,6 +249,17 @@ def overwolf_key_owner(key: str) -> int | None:
         if secrets.compare_digest(v.encode(), key.encode()):
             return int(k.split(":", 1)[1])
     return None
+
+
+def pay_aces(game_id: str, payouts: list[tuple[int, int]]) -> bool:
+    """Pay ace bonuses once per game (a game can be on more than one host's bet page). False if already paid."""
+    with Tx() as c:
+        if c.execute("SELECT 1 FROM meta WHERE key = ?", (f"aces:{game_id}",)).fetchone():
+            return False
+        c.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (f"aces:{game_id}", "paid"))
+        for discord_id, coins in payouts:
+            c.execute("UPDATE users SET balance = balance + ? WHERE discord_id = ?", (coins, discord_id))
+    return True
 
 
 def get_meta(key: str) -> str | None:
@@ -401,9 +432,12 @@ def settle_bets(match_id: int, markets: set[str], judge) -> list[sqlite3.Row] | 
                 c.execute("UPDATE users SET balance = balance + ? WHERE discord_id = ?", (payout, b["user_id"]))
             done.append(b["id"])
         # Nothing left: done. Otherwise 'awaiting' the scoreboard: still settled/refunded later,
-        # but no longer blocks the player from opening betting on their next game.
+        # but no longer blocks the player from opening betting on their next game. A Valorant game also
+        # waits for its scoreboard with nothing left to pay, so the post-game recap still gets posted.
         left = c.execute("SELECT 1 FROM bets WHERE match_id = ? AND status = 'pending'", (match_id,)).fetchone()
-        c.execute("UPDATE matches SET status = ? WHERE id = ?", ("awaiting" if left else "resolved", match_id))
+        no_board = c.execute("SELECT 1 FROM matches WHERE id = ? AND game = 'valorant' AND tracker_match_id IS NULL",
+                             (match_id,)).fetchone()
+        c.execute("UPDATE matches SET status = ? WHERE id = ?", ("awaiting" if left or no_board else "resolved", match_id))
     if not done:
         return []
     return conn.execute(f"SELECT * FROM bets WHERE id IN ({','.join('?' * len(done))})", done).fetchall()
