@@ -59,7 +59,8 @@ AUTO_OPEN = os.getenv("AUTO_OPEN", "1") == "1"            # open betting when Di
 ACE_COINS = int(os.getenv("ACE_COINS", "100"))  # paid to a linked player for each ace (all 5 enemies in one round)
 AUTO_WINDOW = int(os.getenv("AUTO_OPEN_WINDOW_SECONDS", "100")) / 60   # in minutes, as open_match expects
 SCORE_RE = re.compile(r"\b(\d{1,2})\s*[-–:]\s*(\d{1,2})\b")
-AUTO_COOLDOWN = timedelta(minutes=25)                     # one auto-open per player per game
+AUTO_COOLDOWN = timedelta(seconds=int(os.getenv("AUTO_OPEN_COOLDOWN_SECONDS", "120")))  # just debounces presence
+# flaps; back-to-back games still open (one match per host is already enforced by active_match_for_host)
 # Overwatch session bets (see overwatch.py): betting opens when a linked player launches Overwatch and pays on the
 # whole session's record once they've closed it and their career profile has caught up.
 OW_WINDOW = int(os.getenv("OVERWATCH_WINDOW_SECONDS", "180")) / 60  # minutes betting stays open after launch
