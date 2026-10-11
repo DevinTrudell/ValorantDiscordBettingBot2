@@ -119,7 +119,7 @@ service (play money only, no alt accounts, no guarantees). `/privacy` shows a sh
    Under **OAuth2 → URL Generator**, tick the `bot` and `applications.commands` scopes and the
    *View Channels*, *Send Messages*, *Embed Links*, *Read Message History* and *Use External Emojis* permissions.
    Open the generated URL to invite the bot. It can join any number of servers: each gets its own coins, links
-   and bets (its own `valbet-<server id>.db`), and an admin runs `/panel` in the channel bets should post in.
+   and bets (its own `valbet-<server id>.db`), and an admin runs `/start` there to set it up.
    Past 75 servers, apply for the Presence and Server Members intents (Discord requires verification at 100);
    if Discord ever refuses them, the bot restarts without status tracking instead of crashing.
 2. **Install:**
@@ -137,7 +137,10 @@ service (play money only, no alt accounts, no guarantees). `/privacy` shows a sh
    [deploy/DEPLOY.md](deploy/DEPLOY.md). That setup also backs up every server's database each night
    (`valbet-backup.timer`, 14 days kept), and stops retrying after 5 crashes in 15 minutes so a bad token
    can't log in thousands of times.
-4. In your betting channel, run `/panel` once and pin the message it posts.
+4. **An admin (Manage Server) runs `/start` in each server** the bot joins (it posts a reminder when it's
+   added). Pick the betting channel and the server's coin settings, then press **Finish**: the instructions are
+   posted in the betting channel, so pin them. Nothing opens until a betting channel is set. `/panel` re-posts
+   the instructions in the current channel and makes it the betting channel.
 
 ## Using it
 
@@ -172,7 +175,7 @@ Commands only work in servers, not DMs. Commands that look things up or post pub
 
 - **Discord status:** for players who ran `/link`, the bot reads their Valorant status, which shows
   the mode, map and live score once a match starts (e.g. "Swiftplay (Ascent) 3 - 1", their team first).
-  - Betting opens by itself when the score first appears ("0 - 0"), in the `/panel` channel, with
+  - Betting opens by itself when the score first appears ("0 - 0"), in the betting channel (set with `/start` or `/panel`), with
     linked friends in the same Valorant party as teammates.
   - Betting closes after `AUTO_OPEN_WINDOW_SECONDS`, or as soon as the first round's result shows,
     whichever is first.
