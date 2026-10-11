@@ -279,7 +279,7 @@ class AmountView(Card):
             return [T("### That option isn't available any more\n-# The lineup changed. Pick again from the post.")]
         if bal < MIN_BET:  # below the minimum bet: nothing to adjust, just a dead button
             return [T(f"### {icon} {odds.bet_label(mk, m['host_riot'], self.market, self.side)} · ×{price:.2f}"),
-                    Sep(), T(f"You have **{bal:,}** coins, under the {MIN_BET}-coin minimum.\n-# Your daily {db.DAILY_AMOUNT:,} coins top you up."),
+                    Sep(), T(f"You have **{bal:,}** coins, under the {MIN_BET}-coin minimum.\n-# Your daily {db.setting('daily_amount'):,} coins top you up."),
                     Row(_b("💸 Broke ass", ButtonStyle.danger, disabled=True), self.start_over_button())]
         lines = [f"# {self.amount:,}  ➜  {db.payout_of(self.amount, price):,}",
                  f"-# bet ➜ pays if right · balance **{bal:,}** · closes {_ts(m['lock_at'])}"]
@@ -1089,7 +1089,7 @@ def panel_embed() -> discord.Embed:
             "**3.** Anyone in the server can bet, playing or not: press **Win**, **Loss**, a top fragger or "
             "**👥 Group bet** on that post. Both bets are optional.\n"
             "**4.** Betting closes before the first round ends. After the game the bot pays out automatically.\n\n"
-            f"💰 Everyone starts with **{db.STARTING_BALANCE:,} coins** and gets **{db.DAILY_AMOUNT:,} free coins every "
+            f"💰 Everyone starts with **{db.setting('starting_balance'):,} coins** and gets **{db.setting('daily_amount'):,} free coins every "
             "day** (at midnight UTC). Coins are play money.\n\n"
             "📖 Type **/info** for everything in detail."),
         color=RED)

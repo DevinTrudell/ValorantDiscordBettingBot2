@@ -13,7 +13,16 @@ STARTING_BALANCE = int(os.getenv("STARTING_BALANCE", "1000"))
 DAILY_AMOUNT = int(os.getenv("DAILY_AMOUNT", "50"))
 OVERWATCH = os.getenv("OVERWATCH", "0") == "1"
 ACTIVE_DAYS = int(os.getenv("ACTIVE_DAYS", "14"))  # daily coins only go to people who used the bot this recently
-GIVE_DAILY_LIMIT = int(os.getenv("GIVE_DAILY_LIMIT", "500"))  # most coins anyone can give, or receive, per day  # Overwatch session bets: off until they're finished
+GIVE_DAILY_LIMIT = int(os.getenv("GIVE_DAILY_LIMIT", "500"))  # most coins anyone can give, or receive, per day
+
+# Settings each server chooses for itself with /start: name -> (default from .env, lowest, highest).
+SETTINGS = {
+    "starting_balance": (STARTING_BALANCE, 0, 100_000),            # coins a new player starts with
+    "daily_amount": (DAILY_AMOUNT, 0, 10_000),                     # free coins a day for active players
+    "kill_coins": (int(os.getenv("KILL_COINS", "5")), 0, 1_000),   # paid to a linked player per kill
+    "ace_coins": (int(os.getenv("ACE_COINS", "250")), 0, 10_000),  # per ace (all 5 enemies in one round)
+    "auto_open": (os.getenv("AUTO_OPEN", "1") == "1", False, True),  # open betting when a linked game starts
+}  # Overwatch session bets: off until they're finished
 
 # One database file per Discord server, so servers never share coins, links, bets or settings. The home
 # server (GUILD_ID) keeps DB_PATH itself; any other server gets "<name>-<server id>.db" next to it.
@@ -223,9 +232,30 @@ def _now() -> datetime:
 
 # ---------- users ----------
 
+def setting(name: str):
+    """This server's value for a /start setting (its .env default until the server changes it)."""
+    default = SETTINGS[name][0]
+    value = get_meta(f"setting:{name}")
+    if value is None or value == "":
+        return default
+    return value == "1" if isinstance(default, bool) else int(value)
+
+
+def set_setting(name: str, value):
+    """Change a /start setting for this server. Raises ValueError outside its allowed range."""
+    default, low, high = SETTINGS[name]
+    if isinstance(default, bool):
+        set_meta(f"setting:{name}", "1" if value else "0")
+        return
+    value = int(value)
+    if not low <= value <= high:
+        raise ValueError(f"must be between {low:,} and {high:,}")
+    set_meta(f"setting:{name}", str(value))
+
+
 def get_user(discord_id: int) -> sqlite3.Row:
     conn.execute("INSERT OR IGNORE INTO users (discord_id, balance, last_seen) VALUES (?, ?, ?)",
-                 (discord_id, STARTING_BALANCE, _now().isoformat()))
+                 (discord_id, setting("starting_balance"), _now().isoformat()))
     return conn.execute("SELECT * FROM users WHERE discord_id = ?", (discord_id,)).fetchone()
 
 
@@ -340,7 +370,7 @@ def transfer(src: int, dst: int, amount: int):
 
 
 def pay_daily_if_due() -> int | None:
-    """Give every recently active user (see ACTIVE_DAYS) DAILY_AMOUNT once per UTC day. Returns how many were paid, or None if already paid today.
+    """Give every recently active user (see ACTIVE_DAYS) this server's daily coins once per UTC day. Returns how many were paid, or None if already paid today.
 
     The date is stored in the db, so restarting the bot never pays twice and a missed day is paid on startup.
     """
@@ -350,7 +380,8 @@ def pay_daily_if_due() -> int | None:
         if row and row[0] == today:
             return None
         since = (_now() - timedelta(days=ACTIVE_DAYS)).isoformat()
-        n = c.execute("UPDATE users SET balance = balance + ? WHERE last_seen >= ?", (DAILY_AMOUNT, since)).rowcount
+        n = c.execute("UPDATE users SET balance = balance + ? WHERE last_seen >= ?",
+                      (setting("daily_amount"), since)).rowcount
         c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_daily_payout', ?)", (today,))
     return n
 

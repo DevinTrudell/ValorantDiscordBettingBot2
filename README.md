@@ -51,8 +51,17 @@ The bot can be in any number of Discord servers. **Each server is completely sep
 (`GUILD_ID`) keeps `valbet.db`; every other server gets `valbet-<server id>.db`. Winning in one server never
 changes your coins in another, and a player links separately in each server they play in.
 
-- **A new server** gets the bot's commands as soon as it's added. Everyone starts at 1,000 coins. An admin
-  (Manage Server) runs `/panel` in the channel where bets should post.
+- **A new server** gets the bot's commands as soon as it's added, and the bot posts a welcome asking an admin
+  to run **`/start`**. That opens a private setup screen with a short intro to the bot and the server's own
+  settings, each saved as soon as it's changed:
+  - the betting channel (it checks the bot can post there)
+  - auto-open betting on or off
+  - starting coins, daily coins, coins per kill and coins per ace
+  - the public leaderboard, and whether it shows the server's name
+
+  **Finish** posts the instructions in the betting channel. `/start` can be run again any time. The amounts in
+  `.env` (`STARTING_BALANCE`, `DAILY_AMOUNT`, `KILL_COINS`, `ACE_COINS`, `AUTO_OPEN`) are only the defaults for
+  servers that haven't changed them. Starting coins only apply to people who haven't used the bot there yet.
 - **A game counts in every server the player is linked in and a member of**, each with its own bet page.
   Linking someone else's Riot ID in another server does nothing for games reported by the owner's own setup.
 - **Things only the home server does:**
@@ -153,7 +162,7 @@ Commands:
 | Who | Commands |
 |---|---|
 | Everyone | `/info` (the full guide, plus the current game), `/link`, `/bet` (opens your bet slip), `/match status`, `/balance`, `/give`, `/leaderboard` (this server or all servers), `/mybets`, `/scout Name#TAG`, `/accuracy`, `/privacy`, `/unlink` (stops the bot following your games and deletes your game history; coins are kept) |
-| Admins (Manage Server) | `/panel` (sets the betting channel), `/public-leaderboard` (join or leave the public board), `/link-for @user Name#TAG` (link a friend) |
+| Admins (Manage Server) | `/start` (set up the server, see below), `/panel` (sets the betting channel and posts the instructions), `/public-leaderboard` (join or leave the public board), `/link-for @user Name#TAG` (link a friend) |
 | Home server only | `/overwolf-link` |
 
 Commands only work in servers, not DMs. Commands that look things up or post publicly (`/link`, `/scout`,

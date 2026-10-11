@@ -60,11 +60,8 @@ VALORANT_APPS = set(os.getenv("VALORANT_APP_IDS", "1443350165678198935,700136079
 PRIVACY_URL = os.getenv("PRIVACY_URL", "")  # where PRIVACY.md is published (Discord asks for it at verification)
 PRESENCE_LOG = "presence_log.jsonl"
 PRESENCE_LOG_MAX = 5_000_000  # bytes, then it rolls over to presence_log.jsonl.1
-AUTO_OPEN = os.getenv("AUTO_OPEN", "1") == "1"            # open betting when Discord shows a match starting
 # Seconds betting stays open after an automatic open. Round 1 (buy phase + fight) takes ~1.5–2.5 min,
 # so 75 s closes it before the first round can end; a round result in the status closes it even sooner.
-ACE_COINS = int(os.getenv("ACE_COINS", "250"))  # paid to a linked player for each ace (all 5 enemies in one round)
-KILL_COINS = int(os.getenv("KILL_COINS", "5"))
 GIVE_MIN_ACCOUNT_DAYS = int(os.getenv("GIVE_MIN_ACCOUNT_DAYS", "30"))  # /give: Discord account at least this old
 GIVE_MIN_MEMBER_DAYS = int(os.getenv("GIVE_MIN_MEMBER_DAYS", "7"))     # /give: in the server at least this long  # paid to a linked player for each kill
 AUTO_WINDOW = int(os.getenv("AUTO_OPEN_WINDOW_SECONDS", "100")) / 60   # in minutes, as open_match expects
@@ -289,7 +286,7 @@ class BetBot(discord.Client):
                 os.replace(PRESENCE_LOG, PRESENCE_LOG + ".1")  # keep one old file; anything older is gone
             with open(PRESENCE_LOG, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"user": str(after.id), "guild": str(after.guild.id), **entry}) + "\n")
-        if AUTO_OPEN:
+        if db.setting("auto_open"):
             try:
                 if db.linked_riot_id(after.id):
                     await self.maybe_auto_open(after, acts)
@@ -328,7 +325,7 @@ class BetBot(discord.Client):
                 db.update_match(m["id"], scouting=json.dumps(sc))
                 log.info("Overwatch session %s continues: %s relaunched the game", m["id"], name)
             return
-        if AUTO_OPEN and db.OVERWATCH and not m:
+        if db.setting("auto_open") and db.OVERWATCH and not m:
             await self.open_ow_session(user_id, name)
 
     async def open_ow_session(self, host_id: int, name: str) -> int | None:
@@ -484,7 +481,7 @@ class BetBot(discord.Client):
         if event not in ("pregame", "match_start"):
             return {"ok": True, "action": "no open match"}
         last = self.auto_opened.get(host_id)
-        if not AUTO_OPEN or (last and now() - last < AUTO_COOLDOWN):
+        if not db.setting("auto_open") or (last and now() - last < AUTO_COOLDOWN):
             return {"ok": True, "action": "not opening (auto-open off or on cooldown)"}
         if other := self.page_for_same_game(host_id, me, party):
             return {"ok": True, "action": f"not opening: same game as match {other['id']}"}
@@ -782,6 +779,19 @@ class BetBot(discord.Client):
     async def on_guild_join(self, guild: discord.Guild):
         await self.sync_commands(guild)  # a new server starts with its own empty data (db.path_for)
         log.info("Added to %s (%s): commands loaded", guild.name, guild.id)
+        # Say hello where the server's admins will see it: its system channel, else the first channel the bot
+        # can post in.
+        channels = [guild.system_channel] + sorted(guild.text_channels, key=lambda c: c.position)
+        for ch in channels:
+            if ch and ch.permissions_for(guild.me).send_messages and ch.permissions_for(guild.me).embed_links:
+                try:
+                    await ch.send(embed=discord.Embed(title="👋 Thanks for adding me!", color=GOLD, description=(
+                        f"{INTRO}\n\n**Admins:** run **/start** to pick the betting channel and this server's coin "
+                        "settings. **Everyone:** `/link Name#TAG` so your games can be bet on, and `/info` explains "
+                        "the rest.")), allowed_mentions=discord.AllowedMentions.none())
+                except discord.HTTPException:
+                    continue
+                break
 
     async def on_guild_remove(self, guild: discord.Guild):
         """Removed from a server: refund its open bets (they could never settle there now) and forget it.
@@ -868,7 +878,7 @@ class BetBot(discord.Client):
                 try:
                     n = db.pay_daily_if_due()
                     if n is not None:
-                        log.info("Daily payout in server %s: %s coins to %s users", g.id, db.DAILY_AMOUNT, n)
+                        log.info("Daily payout in server %s: %s coins to %s users", g.id, db.setting("daily_amount"), n)
                 except Exception:
                     log.exception("Daily payout failed in server %s", g.id)
 
@@ -1325,11 +1335,12 @@ class BetBot(discord.Client):
 
     @staticmethod
     def pay_aces(detail: MatchDetail) -> list[tuple[int, int, int, int]]:
-        """ACE_COINS per ace and KILL_COINS per kill to every linked player in this game, once per game:
+        """This server's ace and kill coins to every linked player in this game, once per game:
         [(discord_id, total coins, aces, kills)]."""
         if detail.id in ("", "?", "overwolf"):  # no real game ID: can't tell games apart, so can't pay just once
             return []
-        bonuses = [(uid, (p.aces or 0) * ACE_COINS + (p.kills or 0) * KILL_COINS, p.aces or 0, p.kills or 0)
+        ace, kill = db.setting("ace_coins"), db.setting("kill_coins")
+        bonuses = [(uid, (p.aces or 0) * ace + (p.kills or 0) * kill, p.aces or 0, p.kills or 0)
                    for p in detail.players if (uid := db.riot_owner(getattr(p, "real_riot_id", p.riot_id)))]
         bonuses = [b for b in bonuses if b[1] > 0]
         if not bonuses or not db.pay_aces(detail.id, [(uid, coins) for uid, coins, _, _ in bonuses]):
@@ -1582,7 +1593,7 @@ def enemy_recap_embed(host_riot: str, opps: list[PlayerStats]) -> discord.Embed:
     avg_rank = odds_rank_name(sum(tiers) / len(tiers)) if tiers else "Unranked"
     avg_kd = sum(p.kd for p in opps) / len(opps)
     e = discord.Embed(
-        title=f"🟥 Enemy team recap: {short(host_riot)}'s next game",
+        title=f"🔴 Enemy team recap: {short(host_riot)}'s next game",
         description=f"Average rank **{avg_rank}** · average K/D **{avg_kd:.2f}**",
         color=RED,
     )
@@ -1654,9 +1665,11 @@ HELD_NOTE = (f"waiting for the final scoreboard (with ACS) for top frag, which h
 def result_embeds(m, markets, detail: MatchDetail, host, outcome, results, bets, aces=None) -> list[discord.Embed]:
     """The whole post-game in one box: scoreboard, top frag, aces, then one line per bettor."""
     board = scoreboard_embed(detail, host, outcome)  # ⭐ on the scoreboard marks the team top frag
-    notes = [f"💥 **Ace{'s' if n > 1 else ''}!** <@{uid}> **+{n * ACE_COINS:,}** coins" for uid, _, n, _ in aces or [] if n]
-    if kill_pay := [f"<@{uid}> +{k * KILL_COINS:,}" for uid, _, _, k in aces or [] if k]:
-        notes.append(f"🔫 **Kill bonus** ({KILL_COINS}/kill): " + " · ".join(kill_pay))
+    ace, kill = db.setting("ace_coins"), db.setting("kill_coins")
+    notes = [f"💥 **Ace{'s' if n > 1 else ''}!** <@{uid}> **+{n * ace:,}** coins"
+             for uid, _, n, _ in aces or [] if n and ace]
+    if kill_pay := [f"<@{uid}> +{k * kill:,}" for uid, _, _, k in aces or [] if k and kill]:
+        notes.append(f"🔫 **Kill bonus** ({kill}/kill): " + " · ".join(kill_pay))
     if results["topfrag"] is None:
         notes.append("⏳ Final scores coming in a minute")
     elif results["topfrag"] == "push":
@@ -1704,9 +1717,23 @@ def pad(text: str, width: int) -> str:
     return out + " " * (width - used)
 
 
+def clip(text: str, width: int) -> str:
+    """Shorten to at most `width` columns, ending in … if it was longer (keeps rows on one line on phones)."""
+    if sum(_width(ch) for ch in text) <= width:
+        return text
+    out, used = "", 0
+    for ch in text:
+        if used + _width(ch) > width - 1:
+            break
+        out += ch
+        used += _width(ch)
+    return out + "…"
+
+
 def scoreboard_embed(detail: MatchDetail, host, outcome) -> discord.Embed:
-    """Like Valorant's end screen: everyone in one list, sorted by performance score; 🟩 your team, 🟥 the other
-    team; rank icon, name, performance score and K/D/A."""
+    """Like Valorant's end screen: everyone in one list, sorted by performance score; 🔵 and **bold** your team,
+    🔴 the other team (green/red mean Win/Loss elsewhere); rank icon, name, performance score and K/D/A.
+    Kept narrow enough that a row fits on one line on a phone."""
     if not any(p.perf is not None for p in detail.players):
         return _scoreboard_embed_by_team(detail, host, outcome)  # no performance scores (tracker.gg backup data)
     mine_t = detail.teams.get(host.team)
@@ -1716,17 +1743,18 @@ def scoreboard_embed(detail: MatchDetail, host, outcome) -> discord.Embed:
              and other_t.rounds_won is not None else "")
     verdict = "Victory" if won else "Defeat" if won is False else "Draw"
     sp = icons.blank()
-    rows = [f"{sp}{sp}{sp}`Score    K / D / A ` `Player`"]
+    rows = [f"{sp}{sp}{sp}`{'Score':>5} {'K/D/A':>8} ` Player"]
     for p in sorted(detail.players, key=lambda p: (-(p.perf or 0), -p.kills)):
-        square = "🟩" if p.team == host.team else "🟥"
+        ours = p.team == host.team
         top = " ⭐" if p.riot_id == outcome.get("topfrag_riot") else ""
-        kda = f"{p.kills} / {p.deaths} / {p.assists}"
+        kda = f"{p.kills}/{p.deaths}/{p.assists}"
         agent = icons.agent(p.agent) or sp
         rank = icons.rank(p.rank, fallback=False) or sp
         # Numbers first in a fixed-width box, the name after it: names of any width (愛あなた, emoji) can't
-        # push the columns out of line.
-        name = short(p.riot_id).replace("`", "'")  # a backtick would break the code style
-        rows.append(f"{square}{agent}{rank}`{p.perf or 0:>5.0f}  {kda:>11} ` `{name}`{top}")
+        # push the columns out of line. Long names are shortened so the row doesn't wrap on a phone.
+        name = discord.utils.escape_markdown(clip(short(p.riot_id), 12))
+        name = f"**{name}**" if ours else name
+        rows.append(f"{'🔵' if ours else '🔴'}{agent}{rank}`{p.perf or 0:>5.0f} {kda:>8} ` {name}{top}")
     board = discord.Embed(title=f"{detail.map} ·{score} {verdict}", description="\n".join(rows)[:4096],
                           color=GREEN if won else RED if won is False else GREY)
     return board
@@ -1752,11 +1780,13 @@ def _scoreboard_embed_by_team(detail: MatchDetail, host, outcome) -> discord.Emb
             top = p.riot_id == outcome.get("topfrag_riot")
             agent = icons.agent(p.agent) or f"`{p.agent[:9]}`"
             acs = f" · `{p.acs:.0f} ACS`" if p.acs is not None else ""
-            rows.append(f"{agent} {icons.rank(p.rank)} **{short(p.riot_id)}**{' ⭐' if top else ''}"
+            name = discord.utils.escape_markdown(clip(short(p.riot_id), 12))
+            name = f"**{name}**" if team_id == host.team else name
+            rows.append(f"{agent} {icons.rank(p.rank)} {name}{' ⭐' if top else ''}"
                         f" · `{p.kills}/{p.deaths}/{p.assists}`{acs}")
         team = detail.teams.get(team_id)
         rounds = f" · {team.rounds_won}" if team and team.rounds_won is not None else ""
-        board.add_field(name=f"{'🟦 Your team' if team_id == host.team else '🟥 Opponents'}{rounds}",
+        board.add_field(name=f"{'🔵 Your team' if team_id == host.team else '🔴 Opponents'}{rounds}",
                         value="\n".join(rows)[:1024] or "—", inline=False)
     board.set_footer(text="⭐ top frag (highest ACS) · K/D/A · ACS = average combat score")
     return board
@@ -2167,7 +2197,7 @@ def info_guide() -> list[discord.Embed]:
         f"full after {hours} hours. `/mybets` shows yours, `/balance` your coins."))
     odds_e.add_field(name="🏁 Reading the post-game box", inline=False, value=(
         "One message per game. It first shows the result and Win/Loss payouts, then turns into the full "
-        "scoreboard once it's in (🟩 the player's team, 🟥 opponents, sorted by Performance Score; ⭐ team top frag).\n"
+        "scoreboard once it's in (🔵 and bold: the player's team, 🔴 opponents, sorted by Performance Score; ⭐ team top frag).\n"
         "Each bettor's line: their **net coins** on the game, then each bet: ✅ won (stake→payout), ❌ lost, "
         "↩️ refunded, ⏳ on hold. **👥** = group bet, **+N%** = its group bonus.\n"
         "⏳ On hold: the coins aren't in your balance yet; they pay once the scoreboard arrives, or are refunded "
@@ -2175,10 +2205,10 @@ def info_guide() -> list[discord.Embed]:
         "them came back and the other top-frag bets were paid at odds re-priced for the real lineup. Ranks in "
         "Swiftplay and other unrated modes show each player's current Competitive rank."))
     odds_e.add_field(name="💰 Coins", inline=False, value=(
-        f"Everyone starts with **{db.STARTING_BALANCE:,}** and gets **{db.DAILY_AMOUNT:,} free every day** at "
+        f"Everyone starts with **{db.setting('starting_balance'):,}** and gets **{db.setting('daily_amount'):,} free every day** at "
         f"midnight UTC (if you've used the bot in the last {db.ACTIVE_DAYS} days). Minimum bet {MIN_BET}: below "
         "that, the bet button says 💸 Broke ass until your daily coins arrive. Coins are play money.\n"
-        f"**Rewards:** linked players get **{KILL_COINS} per kill** and **{ACE_COINS} per ace** in every game the bot "
+        f"**Rewards:** linked players get **{db.setting('kill_coins')} per kill** and **{db.setting('ace_coins')} per ace** in every game the bot "
         "settles, bets or not.\n"
         f"`/give` sends coins to a friend: up to {db.GIVE_DAILY_LIMIT:,} a day each way, from accounts at least "
         f"{GIVE_MIN_ACCOUNT_DAYS} days old that joined the server {GIVE_MIN_MEMBER_DAYS}+ days ago."))
@@ -2198,8 +2228,8 @@ def info_guide() -> list[discord.Embed]:
         "another server; you /link in each one you play in.\n"
         "`/leaderboard` shows this server. **All servers** shows the public board: only servers whose admins "
         "joined it, by display name (the server's name only if it chose to show it).\n"
-        "**Admins (Manage Server):** `/panel` sets the betting channel, `/public-leaderboard` joins or leaves "
-        "the public board, `/link-for` links a friend.\n"
+        "**Admins (Manage Server):** `/start` sets up the server (betting channel, auto-open, starting and daily "
+        "coins, kill and ace rewards, public board), `/panel` re-posts the instructions, `/link-for` links a friend.\n"
         "`/privacy` says what the bot keeps; `/unlink` deletes your Riot ID and game history here."))
     return [how, odds_e, setup, servers]
 
@@ -2242,8 +2272,8 @@ def info_match(m) -> discord.Embed:
         lines.append(f"🗺️ {sc['map']}: **{rec[0]}–{rec[1] - rec[0]}** recently")
     if m["mode"] in odds.MODE_ROUNDS:
         lines.append(f"⏱️ First to {odds.MODE_ROUNDS[m['mode']]} rounds: upsets are likelier, odds sit closer to even")
-    lines += [f"🟦 {stat_line(PlayerStats.from_dict(t))}" for t in sc.get("teammates", [])]
-    lines += [f"🟥 {stat_line(PlayerStats.from_dict(o))}" for o in sc.get("opponents", [])]
+    lines += [f"🔵 {stat_line(PlayerStats.from_dict(t))}" for t in sc.get("teammates", [])]
+    lines += [f"🔴 {stat_line(PlayerStats.from_dict(o))}" for o in sc.get("opponents", [])]
     if lines:
         e.add_field(name="📋 Scouting", inline=False, value="\n".join(lines)[:1024])
     return e
@@ -2293,14 +2323,167 @@ async def accuracy(inter: discord.Interaction):
 
 # ---------- betting ----------
 
-@bot.tree.command(description="Post the betting control panel here (automatic bets post in this channel)")
-@app_commands.default_permissions(manage_guild=True)  # moves where every automatic bet posts
-async def panel(inter: discord.Interaction):
-    perms = inter.channel.permissions_for(inter.guild.me)
+def missing_permissions(channel) -> list[str]:
+    """What the bot lacks to run betting in this channel (empty = all good)."""
+    perms = channel.permissions_for(channel.guild.me)
     needed = {"View Channel": perms.view_channel, "Send Messages": perms.send_messages,
               "Embed Links": perms.embed_links, "Read Message History": perms.read_message_history,
               "Use External Emojis": perms.use_external_emojis}
-    if missing := [k for k, ok in needed.items() if not ok]:
+    return [k for k, ok in needed.items() if not ok]
+
+
+INTRO = ("**Valorant Betting Bot** lets your friends bet play-money coins on each other's Valorant games. Betting "
+         "opens by itself when a linked player starts a match: bet on the result, the team's top fragger or a "
+         "group pool. The bot settles everything from the official match record and posts a scoreboard recap. "
+         "Players earn coins for kills and aces. Coins are play money only: they can never be bought, sold or "
+         "cashed out.")
+
+
+class CoinsModal(discord.ui.Modal, title="Coins and rewards"):
+    """/start: this server's coin amounts."""
+    FIELDS = (("starting_balance", "Starting coins (new players)"), ("daily_amount", "Daily coins (active players)"),
+              ("kill_coins", "Coins per kill"), ("ace_coins", "Coins per ace"))
+
+    def __init__(self, setup: "SetupView"):
+        super().__init__()
+        self.setup = setup
+        self.inputs = {}
+        for name, label in self.FIELDS:
+            _, low, high = db.SETTINGS[name]
+            box = discord.ui.TextInput(label=label, default=str(db.setting(name)), max_length=6,
+                                       placeholder=f"{low}–{high:,}")
+            self.inputs[name] = box
+            self.add_item(box)
+
+    async def on_submit(self, inter: discord.Interaction):
+        problems = []
+        for name, label in self.FIELDS:
+            raw = self.inputs[name].value.replace(",", "").strip()
+            try:
+                db.set_setting(name, int(raw))
+            except ValueError as e:
+                problems.append(f"{label}: {e if raw.lstrip('-').isdigit() else 'not a number'}")
+        await self.setup.show(inter, "⚠️ " + " · ".join(problems) if problems else "✅ Coins and rewards saved.")
+
+
+class SetupView(discord.ui.View):
+    """/start: the server's setup screen. Every change is saved at once; Finish posts the instructions in the
+    betting channel. Only people who can manage the server can use it."""
+
+    def __init__(self):
+        super().__init__(timeout=900)
+        self.build()
+
+    def build(self):
+        self.clear_items()
+        on = lambda key: db.get_meta(key) == "on"
+        channel = discord.ui.ChannelSelect(channel_types=[discord.ChannelType.text], row=0,
+                                           placeholder="Pick the betting channel")
+        channel.callback = self._channel
+        self.add_item(channel)
+        for label, cb, active, row in (
+                (f"Auto-open betting: {'On' if db.setting('auto_open') else 'Off'}", self._auto_open,
+                 db.setting("auto_open"), 1),
+                (f"Public leaderboard: {'On' if on('public_leaderboard') else 'Off'}", self._public,
+                 on("public_leaderboard"), 1),
+                (f"Show server name there: {'On' if on('public_server_name') else 'Off'}", self._server_name,
+                 on("public_server_name"), 1)):
+            b = discord.ui.Button(label=label, row=row,
+                                  style=discord.ButtonStyle.success if active else discord.ButtonStyle.secondary)
+            b.callback = cb
+            self.add_item(b)
+        coins = discord.ui.Button(label="💰 Coins and rewards…", style=discord.ButtonStyle.primary, row=2)
+        coins.callback = self._coins
+        finish = discord.ui.Button(label="✅ Finish: post instructions", style=discord.ButtonStyle.success, row=2)
+        finish.callback = self._finish
+        self.add_item(coins)
+        self.add_item(finish)
+
+    def embed(self, guild: discord.Guild, note: str | None = None) -> discord.Embed:
+        cid = db.get_meta("panel_channel")
+        channel = f"<#{cid}>" if cid else "**not set**: pick one below"
+        public = db.get_meta("public_leaderboard") == "on"
+        e = discord.Embed(title="👋 Set up the betting bot", color=GOLD, description=(
+            f"{INTRO}\n\n**This server's settings** (saved as you change them):\n"
+            f"📍 Betting channel: {channel}\n"
+            f"🤖 Auto-open betting when a linked player's game starts: **{'On' if db.setting('auto_open') else 'Off'}**\n"
+            f"💰 Starting coins **{db.setting('starting_balance'):,}** · daily **{db.setting('daily_amount'):,}** · "
+            f"per kill **{db.setting('kill_coins'):,}** · per ace **{db.setting('ace_coins'):,}**\n"
+            f"🌍 Public leaderboard: **{'On' if public else 'Off'}**"
+            + (f" (server name {'shown' if db.get_meta('public_server_name') == 'on' else 'hidden'})" if public else "")
+            + "\n\nCoins are separate in every server. Starting coins only apply to people who haven't used the bot "
+              "here yet. Players then `/link Name#TAG`, and `/info` explains everything."))
+        if note:
+            e.add_field(name="\u200b", value=note, inline=False)
+        e.set_footer(text=f"Setting up {guild.name} · only people who can manage the server can change this")
+        return e
+
+    async def show(self, inter: discord.Interaction, note: str | None = None):
+        self.build()
+        await inter.response.edit_message(embed=self.embed(inter.guild, note), view=self)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.permissions.manage_guild:
+            return True
+        await inter.response.send_message("Only people who can manage this server can change its settings.",
+                                          ephemeral=True)
+        return False
+
+    async def _channel(self, inter: discord.Interaction):
+        picked = inter.data["values"][0]
+        channel = inter.guild.get_channel(int(picked))
+        if channel is None:
+            return await self.show(inter, "⚠️ I can't see that channel.")
+        if missing := missing_permissions(channel):
+            return await self.show(inter, f"⚠️ In {channel.mention} I still need: **{', '.join(missing)}**.")
+        db.set_meta("panel_channel", str(channel.id))
+        await self.show(inter, f"✅ Bets will post in {channel.mention}.")
+
+    async def _auto_open(self, inter: discord.Interaction):
+        db.set_setting("auto_open", not db.setting("auto_open"))
+        await self.show(inter)
+
+    async def _public(self, inter: discord.Interaction):
+        public = db.get_meta("public_leaderboard") != "on"
+        db.set_meta("public_leaderboard", "on" if public else "off")
+        if not public:
+            db.set_meta("public_server_name", "off")
+        await self.show(inter)
+
+    async def _server_name(self, inter: discord.Interaction):
+        if db.get_meta("public_leaderboard") != "on":
+            return await self.show(inter, "Turn the public leaderboard on first.")
+        db.set_meta("public_server_name", "off" if db.get_meta("public_server_name") == "on" else "on")
+        await self.show(inter)
+
+    async def _coins(self, inter: discord.Interaction):
+        await inter.response.send_modal(CoinsModal(self))
+
+    async def _finish(self, inter: discord.Interaction):
+        cid = db.get_meta("panel_channel")
+        channel = inter.guild.get_channel(int(cid)) if cid else None
+        if channel is None:
+            return await self.show(inter, "⚠️ Pick a betting channel first.")
+        try:
+            await channel.send(embed=ui.panel_embed())
+        except discord.HTTPException:
+            return await self.show(inter, f"⚠️ I couldn't post in {channel.mention}. Check my permissions there.")
+        db.set_meta("setup_done", "1")
+        await self.show(inter, f"🎉 All set! The instructions are posted in {channel.mention} (pin them). Run "
+                               "`/start` again any time to change these settings.")
+
+
+@bot.tree.command(name="start", description="Set up the bot for this server: betting channel, coins and more")
+@app_commands.default_permissions(manage_guild=True)
+async def start(inter: discord.Interaction):
+    view = SetupView()
+    await inter.response.send_message(embed=view.embed(inter.guild), view=view, ephemeral=True)
+
+
+@bot.tree.command(description="Post the betting control panel here (automatic bets post in this channel)")
+@app_commands.default_permissions(manage_guild=True)  # moves where every automatic bet posts
+async def panel(inter: discord.Interaction):
+    if missing := missing_permissions(inter.channel):
         return await inter.response.send_message(f"I need these permissions in this channel first: "
                                                  f"**{', '.join(missing)}**.", ephemeral=True)
     try:
