@@ -39,4 +39,10 @@ admins also chose `show_server_name:True`. `/public-leaderboard show:False` take
 - If the bot is removed from a server, open bets there are refunded. That server's data stays on file, so
   everything is restored if the bot is added back. The owner deletes it on request.
 
-`/privacy` in Discord shows a short version of this page.
+`/privacy` in Discord shows a short version of this page. See also the [Terms of Service](TERMS.md).
+
+## Changes and contact
+
+This policy may be updated; the latest version is always in this file. Questions or deletion requests: open
+an issue at https://github.com/DevinTrudell/ValorantDiscordBettingBot2/issues, or ask the bot owner in a
+server that uses the bot.

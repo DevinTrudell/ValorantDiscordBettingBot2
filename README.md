@@ -79,7 +79,8 @@ changes your coins in another, and a player links separately in each server they
 
 ### Privacy
 
-[PRIVACY.md](PRIVACY.md) lists what the bot stores and why. `/privacy` shows a short version in Discord.
+[PRIVACY.md](PRIVACY.md) lists what the bot stores and why, and [TERMS.md](TERMS.md) has the terms of
+service (play money only, no alt accounts, no guarantees). `/privacy` shows a short version in Discord.
 `/unlink` deletes a player's Riot ID and game history in that server. Set `PRIVACY_URL` to wherever
 `PRIVACY.md` is published; Discord asks for it when verifying a bot in 75+ servers.
 
