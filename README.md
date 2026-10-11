@@ -36,7 +36,7 @@ wrong the bet is lost right away; if it's right it waits for the top frag; a dra
 - **Kill and ace rewards:** linked players get `KILL_COINS` (5) per kill and `ACE_COINS` (250) per ace in every
   game the bot settles, whether anyone bet or not. Each game pays once per server. The post-game box shows
   them as 💥 **Ace!** and 🔫 **Kill bonus** lines.
-- **Minimum bet** is `MIN_BET` (10). Below that, the bet screen shows a disabled **💸 Broke ass** button (with
+- **Minimum bet** is `MIN_BET` (10). Below that, the bet screen shows a disabled **Not enough coins** button (with
   **↩ Start over** still available) until your daily coins arrive.
 - **`/give`** sends coins to a friend, with limits so extra accounts can't funnel coins into one:
   - At most `GIVE_DAILY_LIMIT` (500) a day given, and 500 a day received, per person.

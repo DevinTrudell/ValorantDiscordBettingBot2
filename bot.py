@@ -2207,7 +2207,7 @@ def info_guide() -> list[discord.Embed]:
     odds_e.add_field(name="💰 Coins", inline=False, value=(
         f"Everyone starts with **{db.setting('starting_balance'):,}** and gets **{db.setting('daily_amount'):,} free every day** at "
         f"midnight UTC (if you've used the bot in the last {db.ACTIVE_DAYS} days). Minimum bet {MIN_BET}: below "
-        "that, the bet button says 💸 Broke ass until your daily coins arrive. Coins are play money.\n"
+        "that, betting waits until your daily coins arrive. Coins are play money.\n"
         f"**Rewards:** linked players get **{db.setting('kill_coins')} per kill** and **{db.setting('ace_coins')} per ace** in every game the bot "
         "settles, bets or not.\n"
         f"`/give` sends coins to a friend: up to {db.GIVE_DAILY_LIMIT:,} a day each way, from accounts at least "

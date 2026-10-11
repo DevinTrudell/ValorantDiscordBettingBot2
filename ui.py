@@ -280,7 +280,7 @@ class AmountView(Card):
         if bal < MIN_BET:  # below the minimum bet: nothing to adjust, just a dead button
             return [T(f"### {icon} {odds.bet_label(mk, m['host_riot'], self.market, self.side)} · ×{price:.2f}"),
                     Sep(), T(f"You have **{bal:,}** coins, under the {MIN_BET}-coin minimum.\n-# Your daily {db.setting('daily_amount'):,} coins top you up."),
-                    Row(_b("💸 Broke ass", ButtonStyle.danger, disabled=True), self.start_over_button())]
+                    Row(_b("Not enough coins", ButtonStyle.secondary, disabled=True), self.start_over_button())]
         lines = [f"# {self.amount:,}  ➜  {db.payout_of(self.amount, price):,}",
                  f"-# bet ➜ pays if right · balance **{bal:,}** · closes {_ts(m['lock_at'])}"]
         if self.amount > bal:
