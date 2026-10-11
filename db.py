@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import sqlite3
@@ -9,11 +11,83 @@ from datetime import datetime, timedelta, timezone
 
 STARTING_BALANCE = int(os.getenv("STARTING_BALANCE", "1000"))
 DAILY_AMOUNT = int(os.getenv("DAILY_AMOUNT", "50"))
-OVERWATCH = os.getenv("OVERWATCH", "0") == "1"  # Overwatch session bets: off until they're finished
+OVERWATCH = os.getenv("OVERWATCH", "0") == "1"
+ACTIVE_DAYS = int(os.getenv("ACTIVE_DAYS", "14"))  # daily coins only go to people who used the bot this recently
+GIVE_DAILY_LIMIT = int(os.getenv("GIVE_DAILY_LIMIT", "500"))  # most coins anyone can give, or receive, per day  # Overwatch session bets: off until they're finished
 
-conn = sqlite3.connect(os.getenv("DB_PATH", "valbet.db"), isolation_level=None)
-conn.row_factory = sqlite3.Row
-conn.executescript(
+# One database file per Discord server, so servers never share coins, links, bets or settings. The home
+# server (GUILD_ID) keeps DB_PATH itself; any other server gets "<name>-<server id>.db" next to it.
+DB_PATH = os.getenv("DB_PATH", "valbet.db")
+HOME = int(os.getenv("GUILD_ID") or 0)
+_guild: contextvars.ContextVar[int] = contextvars.ContextVar("valbet_guild")
+_conns: dict[int, sqlite3.Connection] = {}
+
+
+def path_for(guild_id: int) -> str:
+    if guild_id == HOME:
+        return DB_PATH
+    stem, ext = os.path.splitext(DB_PATH)
+    return f"{stem}-{guild_id}{ext or '.db'}"
+
+
+def current_guild() -> int:
+    """The server whose data this code is working on. Every entry point (interaction, status update, Overwolf
+    report, background loop) picks one; running without one is a bug, never a silent fall back to another server."""
+    try:
+        return _guild.get()
+    except LookupError:
+        raise RuntimeError("No server selected for this database call") from None
+
+
+@contextlib.contextmanager
+def use(guild_id: int):
+    """Work on this server's data inside the block (and in any task started from it)."""
+    token = _guild.set(int(guild_id))
+    try:
+        yield
+    finally:
+        _guild.reset(token)
+
+
+def set_guild(guild_id: int) -> contextvars.Token:
+    return _guild.set(int(guild_id))
+
+
+def reset_guild(token: contextvars.Token):
+    _guild.reset(token)
+
+
+def _connection(guild_id: int) -> sqlite3.Connection:
+    if guild_id not in _conns:
+        _conns[guild_id] = _open(path_for(guild_id))
+    return _conns[guild_id]
+
+
+def close(guild_id: int):
+    """The bot left this server: let go of its file (kept on disk, reopened if the bot is added back)."""
+    if c := _conns.pop(guild_id, None):
+        c.close()
+
+
+class _CurrentConnection:
+    """`conn` below: the selected server's connection."""
+
+    def __getattr__(self, name):
+        return getattr(_connection(current_guild()), name)
+
+
+conn = _CurrentConnection()
+
+
+def _open(path: str) -> sqlite3.Connection:
+    c = sqlite3.connect(path, isolation_level=None)
+    c.row_factory = sqlite3.Row
+    _migrate(c)
+    return c
+
+
+def _migrate(conn: sqlite3.Connection):
+    conn.executescript(
     """
     PRAGMA journal_mode=WAL;
     CREATE TABLE IF NOT EXISTS users (
@@ -69,14 +143,17 @@ conn.executescript(
         UNIQUE (discord_id, ended_at)
     );
     """
-)
-# Columns added after the first release (existing databases get them on startup).
-for _table, _col, _ddl in (("users", "battletag", "TEXT"), ("matches", "game", "TEXT NOT NULL DEFAULT 'valorant'"),
-                           ("matches", "outcome", "TEXT"),  # win | loss | push, for checking the odds afterwards
-                           ("bets", "grp", "INTEGER NOT NULL DEFAULT 0"),  # 1 = part of a group pool
-                           ("users", "ow_id", "TEXT")):  # Blizzard player ID for the linked BattleTag
-    if _col not in {r[1] for r in conn.execute(f"PRAGMA table_info({_table})")}:
-        conn.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} {_ddl}")
+    )
+    # Columns added after the first release (existing databases get them on startup).
+    for _table, _col, _ddl in (("users", "battletag", "TEXT"), ("matches", "game", "TEXT NOT NULL DEFAULT 'valorant'"),
+                               ("matches", "outcome", "TEXT"),  # win | loss | push, for checking the odds afterwards
+                               ("bets", "grp", "INTEGER NOT NULL DEFAULT 0"),  # 1 = part of a group pool
+                               ("users", "ow_id", "TEXT"),  # Blizzard player ID for the linked BattleTag
+                               ("users", "last_seen", "TEXT")):  # last command/bet: only active people get dailies
+        if _col not in {r[1] for r in conn.execute(f"PRAGMA table_info({_table})")}:
+            conn.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} {_ddl}")
+            if _col == "last_seen":  # everyone already here counts as active from today
+                conn.execute("UPDATE users SET last_seen = ?", (_now().isoformat(),))
 
 # Group pools: everyone who joins the pool on the same outcome gets a bonus on their payout once the pool
 # is big enough, e.g. "500:10,1000:20,2000:30" = +10% from 500 coins, +20% from 1,000, +30% from 2,000.
@@ -109,6 +186,12 @@ def group_pools(bets) -> dict[tuple[str, str], dict]:
             for k, p in pools.items()}
 
 
+def payout_of(amount: int, odds: float, bonus: int = 0) -> int:
+    """What a winning bet pays, in whole coins (rounded down). The tiny round() first stops float error from
+    paying 1 short: 100 x 1.15 is 114.99999999999999 in floating point."""
+    return int(round(amount * odds * (1 + bonus / 100), 6))
+
+
 def _payouts(c, match_id: int):
     """payout(bet, status) for this match: winnings, plus the group bonus for group-pool bets."""
     pools = group_pools(c.execute("SELECT * FROM bets WHERE match_id = ?", (match_id,)).fetchall())
@@ -119,7 +202,7 @@ def _payouts(c, match_id: int):
         if st != "won":
             return 0
         bonus = pools.get((b["market"], b["side"]), {}).get("bonus", 0) if b["grp"] else 0
-        return int(b["amount"] * b["odds"] * (1 + bonus / 100))
+        return payout_of(b["amount"], b["odds"], bonus)
     return payout
 
 
@@ -141,8 +224,19 @@ def _now() -> datetime:
 # ---------- users ----------
 
 def get_user(discord_id: int) -> sqlite3.Row:
-    conn.execute("INSERT OR IGNORE INTO users (discord_id, balance) VALUES (?, ?)", (discord_id, STARTING_BALANCE))
+    conn.execute("INSERT OR IGNORE INTO users (discord_id, balance, last_seen) VALUES (?, ?, ?)",
+                 (discord_id, STARTING_BALANCE, _now().isoformat()))
     return conn.execute("SELECT * FROM users WHERE discord_id = ?", (discord_id,)).fetchone()
+
+
+def peek_user(discord_id: int) -> sqlite3.Row | None:
+    """Their row if they have one, without creating it (looking someone up mustn't hand them coins)."""
+    return conn.execute("SELECT * FROM users WHERE discord_id = ?", (discord_id,)).fetchone()
+
+
+def touch(discord_id: int):
+    """They just used the bot: keeps their daily coins coming."""
+    conn.execute("UPDATE users SET last_seen = ? WHERE discord_id = ?", (_now().isoformat(), discord_id))
 
 
 def linked_riot_id(discord_id: int) -> str | None:
@@ -208,23 +302,45 @@ def set_riot_id(discord_id: int, riot_id: str):
 
 
 def unlink(discord_id: int) -> bool:
-    """Forget someone's Riot ID and BattleTag (balance and bets stay). False if nothing was linked."""
+    """Forget someone's Riot ID, BattleTag and game history (balance and bets stay). False if nothing was linked."""
+    conn.execute("DELETE FROM games WHERE discord_id = ?", (discord_id,))
     return conn.execute("UPDATE users SET riot_id = NULL, battletag = NULL, ow_id = NULL WHERE discord_id = ? "
                         "AND (riot_id IS NOT NULL OR battletag IS NOT NULL)", (discord_id,)).rowcount == 1
 
 
 def transfer(src: int, dst: int, amount: int):
+    if amount <= 0:
+        raise ValueError("Give at least 1 coin.")
+    if src == dst:
+        raise ValueError("You can't give coins to yourself.")
     get_user(src), get_user(dst)
+    today = _now().date().isoformat()
     with Tx() as c:
         bal = c.execute("SELECT balance FROM users WHERE discord_id = ?", (src,)).fetchone()[0]
         if bal < amount:
             raise ValueError(f"You only have {bal:,} coins.")
+        # Daily caps both ways, so extra accounts can't funnel their free coins into one.
+        counted = {}
+        for kind, who in (("given", src), ("received", dst)):
+            row = c.execute("SELECT value FROM meta WHERE key = ?", (f"{kind}:{today}:{who}",)).fetchone()
+            counted[kind] = int(row[0]) if row else 0
+        if counted["given"] + amount > GIVE_DAILY_LIMIT:
+            raise ValueError(f"You can give up to {GIVE_DAILY_LIMIT:,} coins a day "
+                             f"({max(GIVE_DAILY_LIMIT - counted['given'], 0):,} left today).")
+        if counted["received"] + amount > GIVE_DAILY_LIMIT:
+            raise ValueError(f"They can receive up to {GIVE_DAILY_LIMIT:,} coins a day "
+                             f"({max(GIVE_DAILY_LIMIT - counted['received'], 0):,} left today).")
+        for kind, who in (("given", src), ("received", dst)):
+            c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                      (f"{kind}:{today}:{who}", str(counted[kind] + amount)))
+        c.execute("DELETE FROM meta WHERE (key LIKE 'given:%' OR key LIKE 'received:%') AND key NOT LIKE ?",
+                  (f"%:{today}:%",))  # yesterday's counts are done with
         c.execute("UPDATE users SET balance = balance - ? WHERE discord_id = ?", (amount, src))
         c.execute("UPDATE users SET balance = balance + ? WHERE discord_id = ?", (amount, dst))
 
 
 def pay_daily_if_due() -> int | None:
-    """Give every user DAILY_AMOUNT once per UTC day. Returns how many were paid, or None if already paid today.
+    """Give every recently active user (see ACTIVE_DAYS) DAILY_AMOUNT once per UTC day. Returns how many were paid, or None if already paid today.
 
     The date is stored in the db, so restarting the bot never pays twice and a missed day is paid on startup.
     """
@@ -233,20 +349,23 @@ def pay_daily_if_due() -> int | None:
         row = c.execute("SELECT value FROM meta WHERE key = 'last_daily_payout'").fetchone()
         if row and row[0] == today:
             return None
-        n = c.execute("UPDATE users SET balance = balance + ?", (DAILY_AMOUNT,)).rowcount
+        since = (_now() - timedelta(days=ACTIVE_DAYS)).isoformat()
+        n = c.execute("UPDATE users SET balance = balance + ? WHERE last_seen >= ?", (DAILY_AMOUNT, since)).rowcount
         c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('last_daily_payout', ?)", (today,))
     return n
 
 
 def overwolf_key(discord_id: int) -> str:
-    """This person's own key for sending their games from the Overwolf app (made on first use)."""
+    """This person's own key for sending their games from the Overwolf app (made on first use). Keys belong to
+    the person, not a server, so they live in the home server's file; reports go to every server they're in."""
     import secrets
-    return get_or_create_meta(f"ow_key:{discord_id}", lambda: secrets.token_urlsafe(18))
+    with use(HOME):
+        return get_or_create_meta(f"ow_key:{discord_id}", lambda: secrets.token_urlsafe(18))
 
 
 def overwolf_key_owner(key: str) -> int | None:
     import secrets
-    for k, v in conn.execute("SELECT key, value FROM meta WHERE key LIKE 'ow_key:%'"):
+    for k, v in _connection(HOME).execute("SELECT key, value FROM meta WHERE key LIKE 'ow_key:%'"):
         if secrets.compare_digest(v.encode(), key.encode()):
             return int(k.split(":", 1)[1])
     return None
@@ -289,7 +408,12 @@ def recent_matches(limit: int = 10) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM matches ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
 
-def leaderboard(limit: int = 10) -> list[sqlite3.Row]:
+def leaderboard(limit: int = 10, active_only: bool = False) -> list[sqlite3.Row]:
+    """Richest first. `active_only`: just people who used the bot in the last ACTIVE_DAYS days."""
+    if active_only:
+        since = (_now() - timedelta(days=ACTIVE_DAYS)).isoformat()
+        return conn.execute("SELECT * FROM users WHERE last_seen >= ? ORDER BY balance DESC LIMIT ?",
+                            (since, limit)).fetchall()
     return conn.execute("SELECT * FROM users ORDER BY balance DESC LIMIT ?", (limit,)).fetchall()
 
 

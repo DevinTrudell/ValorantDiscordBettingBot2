@@ -69,6 +69,6 @@ Don't forward port 8787 on your router: it only needs to work inside your home n
 | Restart | `systemctl restart valbet` |
 | Stop / start | `systemctl stop valbet` / `systemctl start valbet` |
 | Update the code | Copy a new bundle over, then `bash deploy/setup.sh` again (keeps the server's `.env` and database) |
-| Back up balances | `cp /opt/valbet/valbet.db /root/valbet-backup.db` |
+| Back up balances | Automatic every night at 04:30 (`valbet-backup.timer`, 14 days kept in `/var/backups/valbet`). Now: `systemctl start valbet-backup` |
 
 Only run one copy of the bot at a time (don't also start it on your PC).

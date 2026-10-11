@@ -19,12 +19,14 @@ load_dotenv()  # before importing db, which reads env vars
 
 import asyncio
 import io
+import hashlib
 import json
 import re
 import unicodedata
 from collections import Counter
 import logging
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -52,11 +54,19 @@ OPEN_TIMEOUT = 45  # seconds: opening betting (all the stat lookups) must finish
 MIN_GAME_TIME = timedelta(minutes=8)  # no Valorant game finishes faster; skip polling until then
 MIN_BET = int(os.getenv("MIN_BET", "10"))
 PRESENCE_TRACKING = os.getenv("PRESENCE_TRACKING", "1") == "1"
+# Discord apps that really are Valorant (Riot's own status, and Discord's game detection). Anyone can make an
+# app called "VALORANT" with any status text, so the name alone is never trusted.
+VALORANT_APPS = set(os.getenv("VALORANT_APP_IDS", "1443350165678198935,700136079562375258").split(","))
+PRIVACY_URL = os.getenv("PRIVACY_URL", "")  # where PRIVACY.md is published (Discord asks for it at verification)
 PRESENCE_LOG = "presence_log.jsonl"
+PRESENCE_LOG_MAX = 5_000_000  # bytes, then it rolls over to presence_log.jsonl.1
 AUTO_OPEN = os.getenv("AUTO_OPEN", "1") == "1"            # open betting when Discord shows a match starting
 # Seconds betting stays open after an automatic open. Round 1 (buy phase + fight) takes ~1.5–2.5 min,
 # so 75 s closes it before the first round can end; a round result in the status closes it even sooner.
-ACE_COINS = int(os.getenv("ACE_COINS", "100"))  # paid to a linked player for each ace (all 5 enemies in one round)
+ACE_COINS = int(os.getenv("ACE_COINS", "250"))  # paid to a linked player for each ace (all 5 enemies in one round)
+KILL_COINS = int(os.getenv("KILL_COINS", "5"))
+GIVE_MIN_ACCOUNT_DAYS = int(os.getenv("GIVE_MIN_ACCOUNT_DAYS", "30"))  # /give: Discord account at least this old
+GIVE_MIN_MEMBER_DAYS = int(os.getenv("GIVE_MIN_MEMBER_DAYS", "7"))     # /give: in the server at least this long  # paid to a linked player for each kill
 AUTO_WINDOW = int(os.getenv("AUTO_OPEN_WINDOW_SECONDS", "100")) / 60   # in minutes, as open_match expects
 SCORE_RE = re.compile(r"\b(\d{1,2})\s*[-–:]\s*(\d{1,2})\b")
 AUTO_COOLDOWN = timedelta(seconds=int(os.getenv("AUTO_OPEN_COOLDOWN_SECONDS", "120")))  # just debounces presence
@@ -93,6 +103,16 @@ def rounds_to_win(text_or_mode: str) -> int:
     """Rounds a team needs to win the game: Swiftplay 5, Spike Rush 4, everything else 13."""
     mode = text_or_mode if text_or_mode in odds.MODE_ROUNDS else status_mode(text_or_mode)
     return odds.MODE_ROUNDS.get(mode, 13)
+
+
+def in_bet_window(m, started: datetime | None) -> bool:
+    """Could a game that started then be the one this page took bets on? It started before betting closed
+    (betting closes by the end of round 1), and not long before betting opened: an earlier game that wasn't
+    indexed yet, or a later one once the player has moved on, is never settled against."""
+    if not started:
+        return True
+    opened, closes = datetime.fromisoformat(m["opened_at"]), datetime.fromisoformat(m["lock_at"])
+    return opened - timedelta(minutes=10) <= started <= closes + timedelta(minutes=5)
 
 
 def finished_games(entries) -> list[tuple[int, str, int, int, str]]:
@@ -166,28 +186,89 @@ def _intents() -> discord.Intents:
     return intents
 
 
+def _per_server(name: str, make=dict):
+    """Bot memory kept separately for each server (the one db.current_guild() selects): match IDs and who has
+    opened what are per-server, like the data itself."""
+    return property(lambda self: self._server_state.setdefault(db.current_guild(), {}).setdefault(name, make()))
+
+
+class CommandTree(app_commands.CommandTree):
+    """Commands only work in a server (each server has its own coins), with a friendly reply for cooldowns
+    and unexpected errors instead of Discord's "The application did not respond"."""
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.guild_id:
+            db.touch(inter.user.id)
+            if inter.guild and not inter.guild.get_member(inter.user.id):  # e.g. about to /link: follow their status
+                asyncio.create_task(load_members(inter.guild, [inter.user.id]))
+            return True
+        await inter.response.send_message("Use me in a server: each server has its own coins and bets.",
+                                          ephemeral=True)
+        return False
+
+    async def on_error(self, inter: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            msg = f"Slow down: try again in {error.retry_after:.0f}s."
+        elif isinstance(error, app_commands.CheckFailure):
+            msg = "You can't use that here."
+        else:
+            log.error("Command /%s failed in server %s", getattr(inter.command, "qualified_name", "?"),
+                      inter.guild_id, exc_info=error)
+            msg = "Something went wrong on my end. Try again in a moment."
+        try:
+            if inter.response.is_done():
+                await inter.followup.send(msg, ephemeral=True)
+            else:
+                await inter.response.send_message(msg, ephemeral=True)
+        except discord.HTTPException:
+            pass
+
+
+async def load_members(guild: discord.Guild, user_ids: list[int]):
+    """Put these members (and their current status) in the cache: Discord only sends status updates the bot can
+    use for cached members, and members aren't all loaded at startup."""
+    for i in range(0, len(user_ids), 100):  # Discord's limit per request
+        try:
+            await guild.query_members(user_ids=user_ids[i:i + 100], presences=PRESENCE_TRACKING, cache=True)
+        except (asyncio.TimeoutError, discord.ClientException) as e:
+            log.warning("Couldn't load members of server %s: %r", guild.id, e)
+
+
+# Public commands that cost an API call or post in the channel: a few per minute per person.
+cooldown = app_commands.checks.cooldown(3, 60, key=lambda i: (i.guild_id, i.user.id))
+
+
 class BetBot(discord.Client):
+    _opening: set[int] = _per_server("opening", set)  # hosts whose betting is mid-open (blocks double opens)
+    _lineup_locks: dict[int, asyncio.Lock] = _per_server("lineup_locks")  # match_id -> serialises update_lineup
+    presence: dict[int, dict] = _per_server("presence")  # discord_id -> latest Valorant status (to find their party)
+    phase: dict[int, str] = _per_server("phase")  # discord_id -> "pregame" | "ingame" | "other", from their status
+    auto_opened: dict[int, datetime] = _per_server("auto_opened")
+    last_score: dict[int, tuple[int, int, str]] = _per_server("last_score")  # discord_id -> (ours, theirs, status)
+    _polled: dict[int, datetime] = _per_server("polled")  # match_id -> last finished-match check (Valorant)
+    ow_playing: dict[int, bool] = _per_server("ow_playing")  # discord_id -> Discord shows them in Overwatch
+    ow_gone: dict[int, datetime] = _per_server("ow_gone")  # discord_id -> when Overwatch left their status
+
     def __init__(self):
-        super().__init__(intents=_intents(),
+        # Members aren't all downloaded at startup (slow and memory-hungry across many servers): only linked
+        # people are loaded (load_linked_members), plus anyone who uses a command.
+        super().__init__(intents=_intents(), chunk_guilds_at_startup=False,
                          allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True))
-        self.tree = app_commands.CommandTree(self)
-        self._opening: set[int] = set()  # hosts whose betting is mid-open (blocks double opens)
-        self._lineup_locks: dict[int, asyncio.Lock] = {}  # match_id -> serialises update_lineup
+        self.tree = CommandTree(self)
+        self._server_state: dict[int, dict] = {}  # guild_id -> the per-server memory above
         self.tracker = TrackerClient(TRACKER_API_KEY)
         self.henrik = henrik.HenrikClient()  # optional: HENRIK_API_KEY in .env
-        self.presence: dict[int, dict] = {}  # discord_id -> latest Valorant status (to find their party)
-        self.phase: dict[int, str] = {}      # discord_id -> "pregame" | "ingame" | "other", from their status
-        self.auto_opened: dict[int, datetime] = {}
-        self.last_score: dict[int, tuple[int, int, str]] = {}  # discord_id -> (ours, theirs, status text)
         self._timers: set[asyncio.Task] = set()  # pending "close betting" timers
-        self._polled: dict[int, datetime] = {}      # match_id -> last finished-match check (Valorant)
+        self._synced: set[int] = set()  # servers whose commands are loaded
         self.ow = ow.OverwatchClient()
-        self.ow_playing: dict[int, bool] = {}       # discord_id -> Discord shows them in Overwatch
-        self.ow_gone: dict[int, datetime] = {}      # discord_id -> when Overwatch left their status
 
     # ---------- Discord status tracking (experiment: can we see when a match starts?) ----------
 
     async def on_presence_update(self, before: discord.Member, after: discord.Member):
+        with db.use(after.guild.id):  # Discord sends one update per shared server: each one acts for its server
+            await self._presence_update(after)
+
+    async def _presence_update(self, after: discord.Member):
         if not db.is_linked(after.id):  # only players who opted in with /link or /link-overwatch
             return
         if db.linked_battletag(after.id):
@@ -199,12 +280,15 @@ class BetBot(discord.Client):
         acts = [activity_dict(a) for a in after.activities if "valorant" in (getattr(a, "name", "") or "").lower()]
         prev = self.presence.get(after.id)
         if prev and prev["activities"] == acts:
-            return  # same change reported once per shared server
+            return  # nothing Valorant-related changed
         entry = {"name": after.display_name, "activities": acts, "at": now().isoformat()}
         self.presence[after.id] = entry
         log.info("Status %s: %s", after.display_name, acts or "not playing Valorant")
-        with open(PRESENCE_LOG, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"user": str(after.id), **entry}) + "\n")
+        if db.current_guild() == db.HOME:  # a debugging aid for the owner's own server only: nobody else's data
+            if os.path.exists(PRESENCE_LOG) and os.path.getsize(PRESENCE_LOG) > PRESENCE_LOG_MAX:
+                os.replace(PRESENCE_LOG, PRESENCE_LOG + ".1")  # keep one old file; anything older is gone
+            with open(PRESENCE_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"user": str(after.id), "guild": str(after.guild.id), **entry}) + "\n")
         if AUTO_OPEN:
             try:
                 if db.linked_riot_id(after.id):
@@ -216,9 +300,12 @@ class BetBot(discord.Client):
 
     @staticmethod
     def betting_channel_id() -> int | None:
-        """Where automatic bets go: the /panel channel, else wherever the last bet was."""
-        last = db.recent_matches(1)
-        cid = db.get_meta("panel_channel") or (last[0]["channel_id"] if last else None)
+        """Where automatic bets go: the /panel channel, else wherever the last bet was. Nowhere once the panel
+        channel was deleted (set to ""), until /panel is run again."""
+        cid = db.get_meta("panel_channel")
+        if cid is None:
+            last = db.recent_matches(1)
+            cid = last[0]["channel_id"] if last else None
         return int(cid) if cid else None
 
     # ---------- Overwatch session bets (Discord status + career profile; see overwatch.py) ----------
@@ -269,7 +356,7 @@ class BetBot(discord.Client):
                 return None
             opened = now()
             match_id = db.create_match(
-                guild_id=int(GUILD_ID or 0), channel_id=channel_id, opener_id=self.user.id, host_id=host_id,
+                guild_id=db.current_guild(), channel_id=channel_id, opener_id=self.user.id, host_id=host_id,
                 host_riot=tag, mode="session", status="open", game="overwatch",
                 opened_at=opened.isoformat(), lock_at=(opened + timedelta(minutes=OW_WINDOW)).isoformat(),
                 baseline_match_id=None, markets=odds.session_market(),
@@ -328,7 +415,25 @@ class BetBot(discord.Client):
 
     async def overwolf_event(self, p: dict) -> dict:
         """Called by the Overwolf app on: agent select ('pregame'), roster changes ('roster'),
-        'match_start' and 'match_end'. Opens betting, fills in teams/opponents, and settles."""
+        'match_start' and 'match_end'. One player's game is acted on in every server they've linked in, each
+        with its own bet page and coins. Reports from the master key (the headless watcher, or the owner's app)
+        aren't tied to a person, so they only act in the home server: elsewhere anyone could have /link-ed that
+        Riot ID."""
+        results = []
+        guilds = self.guilds if p.get("owner") else [g for g in self.guilds if g.id == db.HOME]
+        for g in guilds:
+            with db.use(g.id):
+                try:
+                    results.append(await self._overwolf_event(p))
+                except Exception:
+                    log.exception("Overwolf event failed in server %s", g.id)
+        if len(results) <= 1:
+            return results[0] if results else {"ok": False, "reason": "The bot isn't in any server."}
+        return {"ok": any(r.get("ok") for r in results),
+                "action": "; ".join(str(r.get("action") or r.get("reason")) for r in results)}
+
+    async def _overwolf_event(self, p: dict) -> dict:
+        """overwolf_event for the selected server."""
         if p.get("game") not in (None, "valorant"):
             return {"ok": True, "action": "ignored (only Valorant is supported)"}
         me, mates, opps, ranks = overwolf_data.lineup(p)
@@ -339,6 +444,8 @@ class BetBot(discord.Client):
         host_id = db.user_by_riot(me)
         if not host_id:
             return {"ok": False, "reason": f"{me} hasn't used /link in Discord."}
+        if not await self.is_member(db.current_guild(), host_id):  # linked here once, but left the server since
+            return {"ok": False, "reason": f"{me} isn't in this server any more."}
         if p.get("owner") and p["owner"] != host_id:  # a personal key only reports its owner's own games
             return {"ok": False, "reason": f"This address belongs to someone else; {me} needs their own /overwolf-link."}
         mode, skip = overwolf_data.parse_mode(p.get("mode"))
@@ -387,7 +494,7 @@ class BetBot(discord.Client):
         self.auto_opened[host_id] = now()
         try:
             match_id, problems = await self.open_match(
-                guild_id=int(GUILD_ID or 0), channel_id=channel_id, opener_id=self.user.id, host_id=host_id,
+                guild_id=db.current_guild(), channel_id=channel_id, opener_id=self.user.id, host_id=host_id,
                 host_name=name, opponents=", ".join(opps) or None, teammates=", ".join(mates) or None,
                 mode=mode, window=AUTO_WINDOW, known_ranks=ranks,
                 map_name=overwolf_data.MAPS.get(p.get("map") or "") or status_map(status) or None)
@@ -403,8 +510,22 @@ class BetBot(discord.Client):
             log.info("Match %s notes: %s", match_id, " · ".join(problems))
         return {"ok": True, "action": f"opened match {match_id}", "problems": problems}
 
+    async def is_member(self, guild_id: int, user_id: int) -> bool:
+        g = self.get_guild(guild_id)
+        if not g:
+            return False
+        if g.get_member(user_id):
+            return True
+        try:
+            await g.fetch_member(user_id)  # not cached (members intent off): ask Discord
+            return True
+        except discord.NotFound:
+            return False
+        except discord.HTTPException:
+            return True  # Discord hiccup: don't drop a real game over it
+
     async def display_name(self, user_id: int) -> str:
-        g = self.get_guild(int(GUILD_ID)) if GUILD_ID else None
+        g = self.get_guild(db.current_guild())
         member = g.get_member(user_id) if g else None
         if member:
             return member.display_name
@@ -516,7 +637,7 @@ class BetBot(discord.Client):
     def valorant_status(acts: list[dict]) -> tuple[str, str | None, int | None]:
         """(status text, party ID, party size) from Valorant's own status."""
         for a in acts:
-            if (a.get("name") or "").strip().lower() == "valorant":
+            if (a.get("name") or "").strip().lower() == "valorant" and a.get("application_id") in VALORANT_APPS:
                 text = " · ".join(a[f] for f in ("details", "state", "large_image_text", "small_image_text") if a.get(f))
                 party = (a.get("party") or {}).get("id")
                 size = ((a.get("party") or {}).get("size") or [None])[0]
@@ -525,6 +646,8 @@ class BetBot(discord.Client):
         return "", None, None
 
     async def maybe_auto_open(self, member: discord.Member, acts: list[dict]):
+        """Open betting at agent select; lock it when round 1 ends; pay Win/Loss from the final score (home
+        server only, see below)."""
         text, party = self.valorant_text(acts)
         phase = "pregame" if PREGAME_RE.search(text) else "ingame" if INGAME_RE.search(text) else "other"
         before, self.phase[member.id] = self.phase.get(member.id), phase
@@ -536,7 +659,10 @@ class BetBot(discord.Client):
             self.last_score[member.id] = (int(score[1]), int(score[2]), text)
         elif last:
             self.last_score.pop(member.id, None)
-            await self.settle_from_status(member, *last)
+            # A Discord status can be faked, so only the home server (friends) pays from it straight away.
+            # Everywhere else Win/Loss waits for HenrikDev's official match record.
+            if db.current_guild() == db.HOME:
+                await self.settle_from_status(member, *last)
         # Valorant's status shows the live score ("Swiftplay (Ascent) 1 - 0"): close betting as soon as
         # the first round has a result, even if the betting window hasn't run out yet.
         if rounds_played >= 1 and (m := db.active_match_for_host(member.id)) and m["status"] == "open":
@@ -587,19 +713,45 @@ class BetBot(discord.Client):
         self.tree.add_command(match_group)
         self.add_dynamic_items(ui.SlipButton, ui.TopFragButton, ui.TopFragSelect, ui.CancelBetsButton)  # the controls on each "Bets open" post survive restarts
         self.add_dynamic_items(ui.RetiredPanelButton)  # old panels' Open/Close betting explain how it works now
-        if GUILD_ID:  # guild sync is instant; global sync can take up to an hour
-            guild = discord.Object(id=int(GUILD_ID))
-            self.tree.copy_global_to(guild=guild)
-            try:
-                await self.tree.sync(guild=guild)
-            except discord.Forbidden:  # not added to that server yet: commands appear after the next restart there
-                log.warning("Not in server %s yet: add the bot there, then restart it to load the commands", GUILD_ID)
-        else:
-            await self.tree.sync()
-        self.backfill_games()
+        self._route_interactions()
+        with db.use(db.HOME):
+            self.backfill_games()
         self.watcher.start()
         self.daily_payout.start()
         await dashboard.start(self)
+
+    def _route_interactions(self):
+        """Every command, button, menu and form runs against the data of the server it was used in.
+        discord.py starts each interaction's handler as a task while parsing it, and a task keeps the context it
+        was started in, so selecting the server around the parse covers all of them in one place."""
+        parsers = self._connection.parsers
+        parse = parsers["INTERACTION_CREATE"]
+
+        def interaction_create(data):
+            if not data.get("guild_id"):  # DMs: no server, so no data (commands are only offered in servers)
+                return parse(data)
+            token = db.set_guild(int(data["guild_id"]))
+            try:
+                return parse(data)
+            finally:
+                db.reset_guild(token)
+        parsers["INTERACTION_CREATE"] = interaction_create
+
+    async def sync_commands(self, guild: discord.abc.Snowflake):
+        """Commands per server: they show up instantly (a global sync can take up to an hour). Only re-sent when
+        they've changed since the last time, so restarts don't send one request per server."""
+        self.tree.copy_global_to(guild=guild)
+        defs = json.dumps([c.to_dict(self.tree) for c in self.tree.get_commands(guild=guild)], sort_keys=True)
+        digest = hashlib.sha256(defs.encode()).hexdigest()
+        with db.use(guild.id):
+            if db.get_meta("commands_hash") == digest:
+                return
+            try:
+                await self.tree.sync(guild=guild)
+            except discord.HTTPException as e:
+                log.warning("Couldn't load the commands in server %s: %s", guild.id, e)
+                return
+            db.set_meta("commands_hash", digest)
 
     @staticmethod
     def backfill_games():
@@ -611,6 +763,8 @@ class BetBot(discord.Client):
             for line in f:
                 try:
                     e = json.loads(line)
+                    if int(e.get("guild") or db.HOME) != db.HOME:
+                        continue
                     entries.append((int(e["user"]), e["at"], BetBot.valorant_text(e["activities"])[0]))
                 except (ValueError, KeyError, TypeError):
                     continue
@@ -626,9 +780,25 @@ class BetBot(discord.Client):
         await super().close()
 
     async def on_guild_join(self, guild: discord.Guild):
-        if GUILD_ID and guild.id == int(GUILD_ID):  # just added to the home server: load the commands there now
-            await self.tree.sync(guild=guild)
-            log.info("Added to %s: commands loaded", guild.name)
+        await self.sync_commands(guild)  # a new server starts with its own empty data (db.path_for)
+        log.info("Added to %s (%s): commands loaded", guild.name, guild.id)
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        """Removed from a server: refund its open bets (they could never settle there now) and forget it.
+        Its data stays on disk; if the bot is added back, everything is as it was minus those bets."""
+        with db.use(guild.id):
+            refunded = sum(db.cancel_match(m["id"]) or 0 for m in db.active_matches())
+            db.set_meta("commands_hash", "")  # re-send the commands if the bot is added back
+        db.close(guild.id)
+        self._server_state.pop(guild.id, None)
+        self._synced.discard(guild.id)
+        log.info("Removed from %s (%s): %d open bets refunded", guild.name, guild.id, refunded)
+
+    async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel):
+        with db.use(channel.guild.id):
+            if db.get_meta("panel_channel") == str(channel.id):  # automatic bets had nowhere to go
+                db.set_meta("panel_channel", "")
+                log.warning("Server %s deleted its betting channel: /panel needs running again", channel.guild.id)
 
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
@@ -638,13 +808,23 @@ class BetBot(discord.Client):
         # Overwatch after a restart: who's in it right now (no new session for them: it may already be running),
         # and open sessions whose player has since closed the game.
         for g in self.guilds:
-            for member in g.members:
-                if db.linked_battletag(member.id):
-                    self.ow_playing[member.id] = any("overwatch" in (getattr(a, "name", "") or "").lower()
-                                                     for a in member.activities)
-        for m in db.active_matches():
-            if m["game"] == "overwatch" and not self.ow_playing.get(m["host_id"]):
-                self.ow_gone.setdefault(m["host_id"], now())
+            if g.id not in self._synced:  # on_ready also fires after reconnects: once per server
+                self._synced.add(g.id)
+                await self.sync_commands(g)
+                with db.use(g.id):
+                    linked = [u["discord_id"] for u in db.all_users() if u["riot_id"] or u["battletag"]]
+                await load_members(g, linked)
+            with db.use(g.id):
+                try:
+                    for member in g.members:
+                        if db.linked_battletag(member.id):
+                            self.ow_playing[member.id] = any("overwatch" in (getattr(a, "name", "") or "").lower()
+                                                             for a in member.activities)
+                    for m in db.active_matches():
+                        if m["game"] == "overwatch" and not self.ow_playing.get(m["host_id"]):
+                            self.ow_gone.setdefault(m["host_id"], now())
+                except Exception:
+                    log.exception("Server %s: startup check failed", g.id)
 
     async def channel(self, channel_id: int) -> discord.abc.Messageable | None:
         try:
@@ -656,13 +836,25 @@ class BetBot(discord.Client):
 
     @tasks.loop(seconds=POLL_SECONDS)
     async def watcher(self):
-        for m in db.active_matches():
-            try:
-                await self.process_match(m)
-            except TrackerError as e:
-                log.warning("Match %s: tracker.gg error: %s", m["id"], e)
-            except Exception:
-                log.exception("Match %s: unexpected error", m["id"])
+        for g in self.guilds:  # one server's trouble (e.g. its database file) never stops the others
+            with db.use(g.id):
+                try:
+                    matches = db.active_matches()
+                except Exception:
+                    log.exception("Server %s: couldn't read its matches", g.id)
+                    continue
+                for m in matches:
+                    try:
+                        await self.process_match(m)
+                    except TrackerError as e:
+                        log.warning("Match %s (server %s): tracker.gg error: %s", m["id"], g.id, e)
+                    except Exception:
+                        log.exception("Match %s (server %s): unexpected error", m["id"], g.id)
+
+    @watcher.error
+    async def _watcher_crashed(self, error):
+        log.error("Match watcher stopped (%r): restarting it", error)
+        self.watcher.restart()
 
     @watcher.before_loop
     async def _before_watcher(self):
@@ -671,12 +863,14 @@ class BetBot(discord.Client):
     # Checks every 10 minutes; pays once per UTC day (the db remembers the last payout date). Silent: no channel post.
     @tasks.loop(minutes=10)
     async def daily_payout(self):
-        try:
-            n = db.pay_daily_if_due()
-            if n is not None:
-                log.info("Daily payout: %s coins to %s users", db.DAILY_AMOUNT, n)
-        except Exception:
-            log.exception("Daily payout failed")
+        for g in self.guilds:
+            with db.use(g.id):
+                try:
+                    n = db.pay_daily_if_due()
+                    if n is not None:
+                        log.info("Daily payout in server %s: %s coins to %s users", g.id, db.DAILY_AMOUNT, n)
+                except Exception:
+                    log.exception("Daily payout failed in server %s", g.id)
 
     @daily_payout.before_loop
     async def _before_daily(self):
@@ -743,27 +937,23 @@ class BetBot(discord.Client):
             await self.settle(m, detail)
 
     async def henrik_finished_match(self, m) -> MatchDetail | None:
-        """The host's newest finished game from HenrikDev, if it started around when betting opened.
-        Raises HenrikError when HenrikDev can't be reached (the caller falls back to tracker.gg)."""
-        opened = datetime.fromisoformat(m["opened_at"])
-        details = await self.henrik.recent_details(m["host_riot"], 1)
-        d = details[0] if details else None
-        if not d or d.id == json.loads(m["scouting"]).get("henrik_baseline"):
-            return None
-        if d.timestamp and d.timestamp < opened - timedelta(minutes=10):
-            return None  # an older game: the one bet on hasn't finished yet
-        return d
+        """The game that was bet on, from HenrikDev: the newest finished game that started around when betting
+        opened. Raises HenrikError when HenrikDev can't be reached (the caller falls back to tracker.gg)."""
+        baseline = json.loads(m["scouting"]).get("henrik_baseline")
+        for d in await self.henrik.recent_details(m["host_riot"], 3):  # newest first
+            if d.id == baseline:
+                return None  # nothing newer than when betting opened
+            if in_bet_window(m, d.timestamp):
+                return d
+        return None
 
     async def find_finished_match(self, m) -> MatchDetail | None:
         """(tracker.gg backup) The newest game in the host's history that wasn't there when betting opened."""
-        opened = datetime.fromisoformat(m["opened_at"])
         for s in await self.tracker.get_recent_matches(m["host_riot"], m["mode"]):
             if s.id == m["baseline_match_id"]:
                 return None
-            # Guard against a previous game that tracker.gg hadn't indexed yet at open time.
-            if s.timestamp and s.timestamp < opened - timedelta(minutes=10):
-                return None
-            return await self.tracker.get_match(s.id)
+            if in_bet_window(m, s.timestamp):
+                return await self.tracker.get_match(s.id)
         return None
 
     # ---------- match actions (all automatic: nobody opens, closes, settles or cancels by hand) ----------
@@ -944,7 +1134,7 @@ class BetBot(discord.Client):
             parts = [f"{ui.bet_icon(m, mk, b['market'], b['side'])} **{b['amount']:,}** on "
                      f"{odds.bet_label(mk, m['host_riot'], b['market'], b['side'])} ×{b['odds']:.2f}" for b in bs]
             lines.append(f"<@{uid}> " + " · ".join(parts))
-        body = ("\n".join(lines) if lines else "Nobody bet on this game.")[:3500]
+        body = fit_lines("\n".join(lines), 3500) if lines else "Nobody bet on this game."
         items = [ui.T(f"### 🔒 Betting closed · {game_names(m)}"), ui.Sep(), ui.T(body)]
         if bets:
             items += [ui.Sep(), ui.T(f"-# {sum(b['amount'] for b in bets):,} coins bet by {len(per)} · GLHF!")]
@@ -959,17 +1149,26 @@ class BetBot(discord.Client):
         m = db.get_match(match_id)
         if not ui.betting_open(m):
             raise ValueError("Betting is closed for this match.")
+        db.touch(user_id)
         if not picks:
             raise ValueError("Pick a result or a top fragger first.")
         mk = json.loads(m["markets"])
+        side_in_game = self.side_in_game(m, user_id)
+        if side_in_game == "opponent":
+            raise ValueError("You're playing against them in this game, so you can't bet on it.")
         # One side per person: with odds that move, betting both sides could lock in a sure profit.
         mine = {(b["market"], b["side"]) for b in db.bets_for_match(match_id)
                 if b["user_id"] == user_id and b["status"] != "refunded"}
+        # A parlay/group bet's result half counts as a Win/Loss pick: no parlaying Win, then betting Loss.
+        mine |= {("win", odds.split_combo(sd)[0]) for mkt, sd in list(mine) if mkt == "combo"}
         if any(mkt == "topfrag" for mkt, _, _ in picks) and not (
                 any(mkt == "win" for mkt, _ in mine) or any(mkt == "win" for mkt, _, _ in picks)):
             raise ValueError("Bet on **Win** or **Loss** first, then pick the team top frag.")
         for market, side, _ in picks:
             other = next((s for mkt, s in mine if mkt == market and s != side), None)
+            if market == "combo" and not other:  # its result half against an existing Win/Loss pick
+                market, side = "win", odds.split_combo(side)[0]
+                other = next((s for mkt, s in mine if mkt == "win" and s != side), None)
             if other:
                 raise ValueError(f"You already bet on **{odds.bet_label(mk, m['host_riot'], market, other)}** "
                                  "in this game. You can add more to that bet, but not bet against it.")
@@ -980,7 +1179,7 @@ class BetBot(discord.Client):
             if market == "win":
                 if side not in ("win", "loss"):
                     raise ValueError("Pick Win or Loss.")
-                if user_id in {u for u, _ in db.game_players(m)} and side == "loss":
+                if side_in_game == "team" and side == "loss":
                     raise ValueError("No betting against yourself 😉")
                 price = mk["win"][side]
             elif market == "combo":
@@ -992,7 +1191,7 @@ class BetBot(discord.Client):
                 price = odds.combo_price(mk, side)
                 if price is None:
                     raise ValueError("Pick a result and a top fragger for a group bet.")
-                if user_id in {u for u, _ in db.game_players(m)} and result == "loss":
+                if side_in_game == "team" and result == "loss":
                     raise ValueError("No betting against yourself 😉")
             else:
                 opt = next((o for o in mk["topfrag"] if o["riot"] == side), None)
@@ -1017,6 +1216,19 @@ class BetBot(discord.Client):
                  and b["status"] != "refunded"]
         db.update_match(match_id, markets=json.dumps(odds.reprice(mk, crowd)))
         return placed, balance
+
+    def side_in_game(self, m, user_id: int) -> str | None:
+        """Is this person playing in the game? 'team' (the host, a listed teammate, or in the host's Valorant
+        party per Discord), 'opponent' (linked to a Riot ID on the other team), or None."""
+        if user_id in {u for u, _ in db.game_players(m)}:
+            return "team"
+        party = self.valorant_text((self.presence.get(m["host_id"]) or {}).get("activities") or [])[1]
+        if party and self.valorant_text((self.presence.get(user_id) or {}).get("activities") or [])[1] == party:
+            return "team"
+        riot = db.linked_riot_id(user_id)
+        if riot and riot.casefold() in {o["riot_id"].casefold() for o in json.loads(m["scouting"]).get("opponents", [])}:
+            return "opponent"
+        return None
 
     def convert_to_parlay(self, user_id: int, match_id: int, riot: str) -> tuple[list[dict], int]:
         """Turn the user's result (Win/Loss) bet(s) on this game into a single parlay with `riot` as team
@@ -1112,14 +1324,18 @@ class BetBot(discord.Client):
                 log.warning("Couldn't update the post for match %s: %s", m["id"], e)
 
     @staticmethod
-    def pay_aces(detail: MatchDetail) -> list[tuple[int, int]]:
-        """ACE_COINS per ace to every linked player who got one this game: [(discord_id, coins)], once per game."""
-        payouts = [(uid, p.aces * ACE_COINS) for p in detail.players
-                   if p.aces and (uid := db.riot_owner(p.riot_id))]
-        if not payouts or not ACE_COINS or not db.pay_aces(detail.id, payouts):
+    def pay_aces(detail: MatchDetail) -> list[tuple[int, int, int, int]]:
+        """ACE_COINS per ace and KILL_COINS per kill to every linked player in this game, once per game:
+        [(discord_id, total coins, aces, kills)]."""
+        if detail.id in ("", "?", "overwolf"):  # no real game ID: can't tell games apart, so can't pay just once
             return []
-        log.info("Ace bonus for match %s: %s", detail.id, payouts)
-        return payouts
+        bonuses = [(uid, (p.aces or 0) * ACE_COINS + (p.kills or 0) * KILL_COINS, p.aces or 0, p.kills or 0)
+                   for p in detail.players if (uid := db.riot_owner(getattr(p, "real_riot_id", p.riot_id)))]
+        bonuses = [b for b in bonuses if b[1] > 0]
+        if not bonuses or not db.pay_aces(detail.id, [(uid, coins) for uid, coins, _, _ in bonuses]):
+            return []
+        log.info("Kill/ace bonus for match %s: %s", detail.id, bonuses)
+        return bonuses
 
     async def settle(self, m, detail: MatchDetail):
         m = db.get_match(m["id"])  # the caller's row may be stale
@@ -1145,7 +1361,7 @@ class BetBot(discord.Client):
                 p = next((p for p in detail.players if p.team == host.team and p.riot_id not in listed
                           and (p.agent or "").casefold() == agent), None)
                 if p:
-                    p.riot_id = o["riot"]
+                    p.real_riot_id, p.riot_id = p.riot_id, o["riot"]  # the real one still gets their bonuses
         outcome = odds.compute_outcome(detail, host)
         results = odds.settle(markets, outcome)
         aces = []
@@ -1156,8 +1372,8 @@ class BetBot(discord.Client):
             # (and so do group combos, unless their result part is already wrong).
             known = {k: v for k, v in results.items() if k != "topfrag"}
             paid = db.settle_bets(m["id"], {"win", "combo"}, lambda market, side: odds.judge(known, market, side))
-            if not paid:  # nothing new to pay (e.g. Win/Loss already paid from Discord status)
-                return
+            if paid is None or (not paid and db.get_meta(f"result_msg:{m['id']}")):
+                return  # nothing new (e.g. Win/Loss already paid and posted from Discord status)
             bets = db.bets_for_match(m["id"])
         else:
             if results.get("absent"):
@@ -1387,6 +1603,17 @@ def odds_rank_name(avg_tier: float) -> str:
     return VALORANT_TIERS[min(max(round(avg_tier), 1), len(VALORANT_TIERS)) - 1]
 
 
+def fit_lines(text: str, limit: int) -> str:
+    """Trim to Discord's limit on whole lines (never half a name or emoji), saying how many were left out."""
+    if len(text) <= limit:
+        return text
+    lines = text.split("\n")
+    while lines and len("\n".join(lines)) > limit - 40:
+        lines.pop()
+    left = text.count("\n") + 1 - len(lines)
+    return "\n".join(lines) + f"\n…and {left} more line{'s' if left != 1 else ''} (see /mybets)"
+
+
 def bettor_breakdown(m, bets) -> str:
     """One short line per bettor: net on this game, then each bet ('✅ Win 500→1,065 · ❌ Team top frag Sam 100').
     The explanations (on hold, refunds, bonuses) live in /info."""
@@ -1427,7 +1654,9 @@ HELD_NOTE = (f"waiting for the final scoreboard (with ACS) for top frag, which h
 def result_embeds(m, markets, detail: MatchDetail, host, outcome, results, bets, aces=None) -> list[discord.Embed]:
     """The whole post-game in one box: scoreboard, top frag, aces, then one line per bettor."""
     board = scoreboard_embed(detail, host, outcome)  # ⭐ on the scoreboard marks the team top frag
-    notes = [f"💥 **Ace{'s' if coins > ACE_COINS else ''}!** <@{uid}> **+{coins:,}** coins" for uid, coins in aces or []]
+    notes = [f"💥 **Ace{'s' if n > 1 else ''}!** <@{uid}> **+{n * ACE_COINS:,}** coins" for uid, _, n, _ in aces or [] if n]
+    if kill_pay := [f"<@{uid}> +{k * KILL_COINS:,}" for uid, _, _, k in aces or [] if k]:
+        notes.append(f"🔫 **Kill bonus** ({KILL_COINS}/kill): " + " · ".join(kill_pay))
     if results["topfrag"] is None:
         notes.append("⏳ Final scores coming in a minute")
     elif results["topfrag"] == "push":
@@ -1435,7 +1664,7 @@ def result_embeds(m, markets, detail: MatchDetail, host, outcome, results, bets,
     if absent := results.get("absent"):
         notes.append(f"↩️ {', '.join(short(r) for r in absent)} not in game: refunded")
     extra = "".join(n + "\n\n" for n in notes) + f"**Bets**\n{bettor_breakdown(m, bets)}"
-    board.description = (((board.description + "\n\n") if board.description else "") + extra)[:4096]
+    board.description = fit_lines(((board.description + "\n\n") if board.description else "") + extra, 4096)
     board.title = f"{game_names(m)} · {board.title}"
     return [board]
 
@@ -1602,6 +1831,7 @@ def pick_match(inter: discord.Interaction, host: discord.Member | None):
 
 # ---------- account commands ----------
 
+@cooldown
 @bot.tree.command(description="Link your Discord account to your Riot ID (Name#TAG)")
 @app_commands.describe(riot_id="Your Riot ID, e.g. TenZ#0505")
 async def link(inter: discord.Interaction, riot_id: str):
@@ -1725,6 +1955,9 @@ async def link_for(inter: discord.Interaction, user: discord.Member, riot_id: st
 @bot.tree.command(name="overwolf-link",
                   description="Your private address for the HomeAssistant Game Events Overwolf app")
 async def overwolf_link(inter: discord.Interaction):
+    if inter.guild_id != db.HOME:  # the app reports to the bot's home network: only for the owner's friends
+        return await inter.response.send_message("The Overwolf app link is only available in the bot owner's "
+                                                 "server. Betting here opens from Discord statuses.", ephemeral=True)
     host = os.getenv("OVERWOLF_WEBHOOK_HOST") or "valbet"
     url = f"http://{host}.local:{dashboard.PORT}/api/ha/{db.overwolf_key(inter.user.id)}"
     await inter.response.send_message(
@@ -1746,6 +1979,20 @@ async def unlink(inter: discord.Interaction):
         else "You don't have anything linked.", ephemeral=True)
 
 
+@bot.tree.command(description="What the bot stores about you, and how to remove it")
+async def privacy(inter: discord.Interaction):
+    await inter.response.send_message(
+        "🔒 **What the bot keeps (separately for each server):** your coin balance and bets, the Riot ID you "
+        "linked, and the results of your games it watched. It reads your Discord game status only after you "
+        "/link, and only to open and settle bets. Ranks and match stats come from public Valorant data "
+        "(HenrikDev). If this server's admins opt in, top balances (display name and coins, and the server's name "
+        "only if they choose) appear on the public leaderboard.\n**To remove it:** /unlink deletes your Riot ID and game history in this server. To delete "
+        "everything (balance and bets too), ask the bot owner.\n"
+        + (f"Full policy: {PRIVACY_URL}" if PRIVACY_URL else "-# Coins are play money: they can't be bought, sold "
+                                                             "or cashed out."), ephemeral=True)
+
+
+@cooldown
 @bot.tree.command(name="scout", description="Look up a player's Valorant rank and recent games")
 async def scout_cmd(inter: discord.Interaction, riot_id: str):
     rid = parse_riot_id(riot_id)
@@ -1770,21 +2017,34 @@ async def scout_cmd(inter: discord.Interaction, riot_id: str):
         await inter.followup.send(f"Couldn't scout **{rid}**: {e}")
 
 
+@cooldown
 @bot.tree.command(description="Check a coin balance")
 async def balance(inter: discord.Interaction, user: discord.Member | None = None):
     user = user or inter.user
-    u = db.get_user(user.id)
+    u = db.get_user(user.id) if user.id == inter.user.id else db.peek_user(user.id)
+    if u is None:  # never used the bot: don't open them an account (and its free coins) just by looking
+        return await inter.response.send_message(f"**{user.display_name}** hasn't used the bot yet.",
+                                                  ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
     riot = f" · {u['riot_id']}" if u["riot_id"] else ""
     held = sum(b["amount"] for b in db.pending_bets_for_user(user.id))
     await inter.response.send_message(f"💰 **{user.display_name}** has **{u['balance']:,}** coins{riot}"
                                       + (f" · ⏳ {held:,} more in bets that haven't paid out yet (/mybets)"
-                                         if held else ""))
+                                         if held else ""), allowed_mentions=discord.AllowedMentions.none())
 
 
+@cooldown
 @bot.tree.command(description="Give some of your coins to another user")
 async def give(inter: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1]):
     if user.id == inter.user.id or user.bot:
         return await inter.response.send_message("Pick someone else.", ephemeral=True)
+    # Brand-new accounts and newcomers can't give: stops extra accounts funnelling their free coins to one.
+    if (now() - inter.user.created_at).days < GIVE_MIN_ACCOUNT_DAYS:
+        return await inter.response.send_message(f"Your Discord account needs to be {GIVE_MIN_ACCOUNT_DAYS} days "
+                                                 "old to give coins.", ephemeral=True)
+    joined = getattr(inter.user, "joined_at", None)
+    if joined and (now() - joined).days < GIVE_MIN_MEMBER_DAYS:
+        return await inter.response.send_message(f"You need to be in this server for {GIVE_MIN_MEMBER_DAYS} days "
+                                                 "to give coins.", ephemeral=True)
     try:
         db.transfer(inter.user.id, user.id, amount)
     except ValueError as e:
@@ -1792,12 +2052,63 @@ async def give(inter: discord.Interaction, user: discord.Member, amount: app_com
     await inter.response.send_message(f"💸 {inter.user.mention} gave {user.mention} **{amount:,}** coins.")
 
 
+@cooldown
 @bot.tree.command(description="Richest bettors")
-async def leaderboard(inter: discord.Interaction):
+@app_commands.describe(scope="Just this server (default), or the public board across every server")
+@app_commands.choices(scope=[app_commands.Choice(name="This server", value="server"),
+                             app_commands.Choice(name="All servers", value="global")])
+async def leaderboard(inter: discord.Interaction, scope: app_commands.Choice[str] | None = None):
+    if scope and scope.value == "global":
+        return await global_leaderboard(inter)
     rows = db.leaderboard()
     lines = [f"**{i}.** <@{r['discord_id']}> — {r['balance']:,}" for i, r in enumerate(rows, 1)]
     e = discord.Embed(title="🏆 Leaderboard", description="\n".join(lines) or "Nobody yet.", color=GOLD)
     await inter.response.send_message(embed=e, allowed_mentions=discord.AllowedMentions.none())
+
+
+async def global_leaderboard(inter: discord.Interaction):
+    """The richest balances across the servers whose admins opted in with /public-leaderboard. Coins stay
+    separate per server: this only lists them side by side, so someone in two servers can appear twice. A server's
+    name is shown only if it chose to show it: otherwise nobody can tell which community a player is in."""
+    await inter.response.defer()
+    rows = []
+    for g in bot.guilds:
+        with db.use(g.id):
+            if db.get_meta("public_leaderboard") != "on":  # opt-in: off until a server's admins turn it on
+                continue
+            server = g.name if db.get_meta("public_server_name") == "on" else None
+            rows += [(r["balance"], r["discord_id"], server) for r in db.leaderboard(10, active_only=True)]
+    rows.sort(key=lambda r: -r[0])
+    lines = []
+    for i, (bal, uid, server) in enumerate(rows[:10], 1):
+        try:  # their Discord-wide name: they may not be in this server, so no mention
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            name = user.display_name
+        except discord.HTTPException:
+            name = "Someone"
+        where = f" · *{discord.utils.escape_markdown(server)}*" if server else ""
+        lines.append(f"**{i}.** {discord.utils.escape_markdown(name)}{where} — {bal:,}")
+    e = discord.Embed(title="🌍 Public leaderboard", description="\n".join(lines) or "No servers have joined yet.",
+                      color=GOLD)
+    e.set_footer(text=f"Coins are separate in each server. Active players only (last {db.ACTIVE_DAYS} days). "
+                      "Servers join with /public-leaderboard (admins).")
+    await inter.followup.send(embed=e, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="public-leaderboard",
+                  description="Put this server's top players on the public leaderboard, or take them off")
+@app_commands.describe(show="On: this server's top players (display name and coins) appear on the public board",
+                       show_server_name="Also show this server's name next to them (off by default)")
+@app_commands.default_permissions(manage_guild=True)
+async def public_leaderboard(inter: discord.Interaction, show: bool, show_server_name: bool = False):
+    db.set_meta("public_leaderboard", "on" if show else "off")
+    db.set_meta("public_server_name", "on" if show and show_server_name else "off")
+    if not show:
+        msg = "This server is off the public leaderboard."
+    else:
+        msg = ("This server's top players now appear on the public leaderboard (`/leaderboard scope:All servers`), "
+               + ("with this server's name." if show_server_name else "by display name only (no server name)."))
+    await inter.response.send_message(msg, ephemeral=True)
 
 
 def info_guide() -> list[discord.Embed]:
@@ -1848,7 +2159,8 @@ def info_guide() -> list[discord.Embed]:
         "**Odds shift a little as people bet** (at most ±5%), like a sportsbook. Every bet keeps the odds it "
         "was placed at. You can add to a bet but not also bet against it in the same game."))
     odds_e.add_field(name="💸 Payouts", inline=False, value=(
-        "**Win/Loss** pays the moment the game ends (from the final score in the player's status).\n"
+        "**Win/Loss** pays when the game ends: instantly from the player's status in the bot's home server, and "
+        "a few minutes later everywhere else, once Valorant's official match record is in (a status can be faked).\n"
         "**Top frag and group bets** pay about a minute later, once the full scoreboard is in; the recap "
         "shows everyone's rank, Performance Score and K/D/A.\n"
         f"If a result never arrives (left early, remake, data unavailable), bets still waiting are refunded in "
@@ -1864,20 +2176,32 @@ def info_guide() -> list[discord.Embed]:
         "Swiftplay and other unrated modes show each player's current Competitive rank."))
     odds_e.add_field(name="💰 Coins", inline=False, value=(
         f"Everyone starts with **{db.STARTING_BALANCE:,}** and gets **{db.DAILY_AMOUNT:,} free every day** at "
-        "midnight UTC. Coins are play money. `/give` sends some to a friend, `/leaderboard` shows the richest."))
+        f"midnight UTC (if you've used the bot in the last {db.ACTIVE_DAYS} days). Minimum bet {MIN_BET}: below "
+        "that, the bet button says 💸 Broke ass until your daily coins arrive. Coins are play money.\n"
+        f"**Rewards:** linked players get **{KILL_COINS} per kill** and **{ACE_COINS} per ace** in every game the bot "
+        "settles, bets or not.\n"
+        f"`/give` sends coins to a friend: up to {db.GIVE_DAILY_LIMIT:,} a day each way, from accounts at least "
+        f"{GIVE_MIN_ACCOUNT_DAYS} days old that joined the server {GIVE_MIN_MEMBER_DAYS}+ days ago."))
     setup = discord.Embed(title="🔗 Linking and games", color=GOLD, description=(
         "**Valorant:** `/link Name#TAG` once (a server manager can use `/link-for`). Turn on Discord's "
         "**Share my activity** so betting can open for your games. `/unlink` stops it.\n"
-        "**Overwolf (optional):** install **HomeAssistant Game Events** from the Overwolf store and paste your "
-        "address from `/overwolf-link`. It names every teammate at agent select.\n"
+        "**Overwolf (optional, bot owner's server only):** install **HomeAssistant Game Events** from the Overwolf "
+        "store and paste your address from `/overwolf-link`. It names every teammate at agent select.\n"
         + ("**Overwatch:** `/link-overwatch Name#1234` and set your Career Profile to **Public**. Discord can't see "
            f"Overwatch matches, so bets are on your **session**: betting opens for {OW_WINDOW:g} minutes when you "
            "launch Overwatch (Winning or Losing session, ×1.90 each), and pays after you close the game: more Quick "
            "Play + Competitive wins than losses = winning session, an even record refunds. Results take about 15 "
            "minutes after closing to show up on Blizzard's profile.\n" if db.OVERWATCH else "") +
-        "Other commands: `/scout Name#TAG`, `/accuracy`, `/panel` (posts the instructions and sets the betting "
-        "channel)."))
-    return [how, odds_e, setup]
+        "Other commands: `/scout Name#TAG`, `/accuracy`, `/mybets`, `/balance`."))
+    servers = discord.Embed(title="🌐 Servers, leaderboards and privacy", color=GOLD, description=(
+        "**Every server is separate:** its own coins, links and bets. Winning here never changes your coins in "
+        "another server; you /link in each one you play in.\n"
+        "`/leaderboard` shows this server. **All servers** shows the public board: only servers whose admins "
+        "joined it, by display name (the server's name only if it chose to show it).\n"
+        "**Admins (Manage Server):** `/panel` sets the betting channel, `/public-leaderboard` joins or leaves "
+        "the public board, `/link-for` links a friend.\n"
+        "`/privacy` says what the bot keeps; `/unlink` deletes your Riot ID and game history here."))
+    return [how, odds_e, setup, servers]
 
 
 def info_match(m) -> discord.Embed:
@@ -1927,15 +2251,18 @@ def info_match(m) -> discord.Embed:
 
 @bot.tree.command(name="info", description="Everything about how the betting works, and the current game in depth")
 async def info_cmd(inter: discord.Interaction):
-    embeds = info_guide()
-    size = lambda e: len(e.title or "") + len(e.description or "") + sum(len(f.name) + len(f.value) for f in e.fields)
+    how, odds_e, *rest = info_guide()
+    # Discord allows 6,000 characters per message across all its embeds: the guide goes in two messages, and
+    # the current games' details join the second one while they fit.
     for m in [m for m in db.active_matches(inter.channel_id) if m["status"] in ("open", "locked", "awaiting")][:3]:
         extra = info_match(m)
-        if sum(size(e) for e in embeds) + size(extra) <= 5800:  # Discord: 6,000 characters per message
-            embeds.append(extra)
-    await inter.response.send_message(embeds=embeds[:10], ephemeral=True)
+        if sum(len(e) for e in rest) + len(extra) <= 5800:
+            rest.append(extra)
+    await inter.response.send_message(embeds=[how, odds_e], ephemeral=True)
+    await inter.followup.send(embeds=rest[:10], ephemeral=True)
 
 
+@cooldown
 @bot.tree.command(description="How accurate the bot's Win/Loss odds have been so far")
 async def accuracy(inter: discord.Interaction):
     preds = db.predictions()
@@ -1967,7 +2294,15 @@ async def accuracy(inter: discord.Interaction):
 # ---------- betting ----------
 
 @bot.tree.command(description="Post the betting control panel here (automatic bets post in this channel)")
+@app_commands.default_permissions(manage_guild=True)  # moves where every automatic bet posts
 async def panel(inter: discord.Interaction):
+    perms = inter.channel.permissions_for(inter.guild.me)
+    needed = {"View Channel": perms.view_channel, "Send Messages": perms.send_messages,
+              "Embed Links": perms.embed_links, "Read Message History": perms.read_message_history,
+              "Use External Emojis": perms.use_external_emojis}
+    if missing := [k for k, ok in needed.items() if not ok]:
+        return await inter.response.send_message(f"I need these permissions in this channel first: "
+                                                 f"**{', '.join(missing)}**.", ephemeral=True)
     try:
         await inter.channel.send(embed=ui.panel_embed())
     except discord.HTTPException:
@@ -1997,7 +2332,7 @@ async def mybets(inter: discord.Interaction):
         status = db.get_match(b["match_id"])["status"]
         lines.append(f"#{b['match_id']} · {b['amount']:,} on "
                      f"**{odds.bet_label(json.loads(b['markets']), b['host_riot'], b['market'], b['side'])}** "
-                     f"(×{b['odds']:.2f} → pays {int(b['amount'] * b['odds']):,}"
+                     f"(×{b['odds']:.2f} → pays {db.payout_of(b['amount'], b['odds']):,}"
                      + (" + group bonus" if b["grp"] else "") + f") · {where.get(status, status)}")
     total = sum(b["amount"] for b in rows)
     note = f"\n\n**{total:,} coins** are in these bets, so they're not in your balance right now."
@@ -2020,5 +2355,17 @@ async def match_status(inter: discord.Interaction, host: discord.Member | None =
 
 
 if __name__ == "__main__":
+    if not db.HOME:  # without it the home server's balances (valbet.db) would be orphaned for an empty file
+        raise SystemExit("Set GUILD_ID in .env to your home server's ID (see .env.example).")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    try:
+        bot.run(DISCORD_TOKEN, log_handler=None)
+    except discord.PrivilegedIntentsRequired:
+        if not PRESENCE_TRACKING:
+            raise
+        # Discord withdrew the Presence / Server Members intents (e.g. 100+ servers without verification):
+        # carry on without Discord statuses (Overwolf and HenrikDev still work) instead of crash-looping.
+        log.critical("Discord refused the Presence/Server Members intents: restarting without status tracking. "
+                     "Turn them on in the Developer Portal (Bot -> Privileged Gateway Intents).")
+        os.environ["PRESENCE_TRACKING"] = "0"
+        os.execv(sys.executable, [sys.executable, *sys.argv])

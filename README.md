@@ -5,39 +5,6 @@ buttons and menus right in Discord. Stats come from the HenrikDev API (tracker.g
 Bets settle on their own once the game shows up in the player's match history, and the bot then posts the
 full scoreboard, including every opponent's rank, agent, K/D/A and Performance Score.
 
-## Features
-
-- **Opens betting by itself** when a linked player's Discord status shows agent select (or the Overwolf app
-  reports a match). Nobody types a command: a **Bets open** post appears in the betting channel.
-- **Bet with buttons:** Win / Loss, team top frag and group bets, each on a private slip that only you see.
-  After a Win/Loss bet you can add a top-frag pick or press **⏭ Skip top frag**.
-- **Closes on its own** once the first round has a result, and posts who bet what.
-- **Post-game recap:** the full scoreboard with agent and rank icons, K/D/A, Performance Score and a ⭐ on
-  the team top frag, plus one line per bettor showing what they won. Posted for every tracked player's game,
-  including games you aren't in.
-- **Pays out instantly:** Win/Loss pays the moment the game ends (from the final score in Discord status);
-  top-frag and group bets pay once the scoreboard is in, or are refunded if it never arrives.
-- **Ace bonus:** any linked player who aces (kills all 5 enemies in one round) gets **100 coins** per ace,
-  shown on the recap (`ACE_COINS` to change it).
-- **Odds that learn:** priced from rank, recent form and the group's win rate, with a 5% house edge, and
-  recalibrated from the bot's own past predictions (`/accuracy`).
-- **Play money only:** everyone starts with coins, gets a daily top-up, and can check `/balance` and
-  `/leaderboard`.
-
-## Screenshots
-
-**Post-game recap with bets** — Coal's group bet (Win + Toothyyy top frag) hit at ×5.22:
-
-![Post-game recap with bets](docs/screenshots/recap-bets.png)
-
-**Post-game recap for a friend's game** — scoreboard for both teams, ⭐ marks the team top frag:
-
-![Post-game recap](docs/screenshots/recap.png)
-
-**Betting closed** — the game card and who bet what:
-
-![Betting closed](docs/screenshots/betting-closed.png)
-
 ## Bets
 
 | Bet | Options | How it's priced |
@@ -60,6 +27,61 @@ once the pool is big enough (with at least `GROUP_MIN_PEOPLE` people, default 2)
 on their winnings: by default +10% from 500 coins, +20% from 1,000, +30% from 2,000 (`GROUP_TIERS`,
 e.g. `500:10,1000:20,2000:30`). The bonus is set by the pool's size when betting closes. If the result is
 wrong the bet is lost right away; if it's right it waits for the top frag; a draw or a top-frag tie refunds it.
+
+## Coins and rewards
+
+- **Starting coins and daily coins:** everyone starts with `STARTING_BALANCE` (1,000) and gets `DAILY_AMOUNT`
+  (50) at midnight UTC, but only if they've used a command or bet in the last `ACTIVE_DAYS` (14) days. That
+  keeps abandoned and extra accounts from piling up coins.
+- **Kill and ace rewards:** linked players get `KILL_COINS` (5) per kill and `ACE_COINS` (250) per ace in every
+  game the bot settles, whether anyone bet or not. Each game pays once per server. The post-game box shows
+  them as 💥 **Ace!** and 🔫 **Kill bonus** lines.
+- **Minimum bet** is `MIN_BET` (10). Below that, the bet screen shows a disabled **💸 Broke ass** button (with
+  **↩ Start over** still available) until your daily coins arrive.
+- **`/give`** sends coins to a friend, with limits so extra accounts can't funnel coins into one:
+  - At most `GIVE_DAILY_LIMIT` (500) a day given, and 500 a day received, per person.
+  - The giver's Discord account must be at least `GIVE_MIN_ACCOUNT_DAYS` (30) days old.
+  - The giver must have been in the server at least `GIVE_MIN_MEMBER_DAYS` (7) days.
+- `/balance @someone` only shows people who have used the bot; it never opens an account for them.
+
+## Many servers
+
+The bot can be in any number of Discord servers. **Each server is completely separate:** its own coins,
+`/link`s, bets, betting channel and leaderboard, kept in its own database file. The home server
+(`GUILD_ID`) keeps `valbet.db`; every other server gets `valbet-<server id>.db`. Winning in one server never
+changes your coins in another, and a player links separately in each server they play in.
+
+- **A new server** gets the bot's commands as soon as it's added. Everyone starts at 1,000 coins. An admin
+  (Manage Server) runs `/panel` in the channel where bets should post.
+- **A game counts in every server the player is linked in and a member of**, each with its own bet page.
+  Linking someone else's Riot ID in another server does nothing for games reported by the owner's own setup.
+- **Things only the home server does:**
+  - Pays Win/Loss instantly from Discord statuses. Everywhere else, Win/Loss waits a few minutes for
+    Valorant's official match record, because a Discord status can be faked.
+  - Offers `/overwolf-link`, since the Overwolf app reports to the bot's home network.
+  - Keeps the status debugging log.
+- **Only real Valorant statuses count:** statuses from Riot's own Discord apps (`VALORANT_APP_IDS`). An app
+  someone makes and names "VALORANT" is ignored.
+- **If the bot is removed from a server,** that server's open bets are refunded. Its data stays on disk and
+  comes back if the bot is added again.
+
+### Public leaderboard
+
+`/leaderboard` shows the current server. `/leaderboard scope:All servers` shows a **public board** of the top
+10 balances across servers. It's **opt-in**: a server appears only after its admins run
+`/public-leaderboard show:True`.
+
+- Players are listed by Discord display name only, with no mentions.
+- The server's name is shown only if its admins also set `show_server_name:True`.
+- `/public-leaderboard show:False` takes the server off the board again.
+- Only active players appear (last `ACTIVE_DAYS` days).
+- Coins aren't combined: someone in two servers can appear twice, once for each balance.
+
+### Privacy
+
+[PRIVACY.md](PRIVACY.md) lists what the bot stores and why. `/privacy` shows a short version in Discord.
+`/unlink` deletes a player's Riot ID and game history in that server. Set `PRIVACY_URL` to wherever
+`PRIVACY.md` is published; Discord asks for it when verifying a bot in 75+ servers.
 
 ### How the odds are worked out
 
@@ -85,7 +107,11 @@ wrong the bet is lost right away; if it's right it waits for the top frag; a dra
    Turn on **Presence Intent** and **Server Members Intent** (used to read players' Valorant status;
    set `PRESENCE_TRACKING=0` in `.env` to skip this).
    Under **OAuth2 → URL Generator**, tick the `bot` and `applications.commands` scopes and the
-   *View Channels*, *Send Messages*, *Embed Links* and *Read Message History* permissions. Open the generated URL to invite the bot.
+   *View Channels*, *Send Messages*, *Embed Links*, *Read Message History* and *Use External Emojis* permissions.
+   Open the generated URL to invite the bot. It can join any number of servers: each gets its own coins, links
+   and bets (its own `valbet-<server id>.db`), and an admin runs `/panel` in the channel bets should post in.
+   Past 75 servers, apply for the Presence and Server Members intents (Discord requires verification at 100);
+   if Discord ever refuses them, the bot restarts without status tracking instead of crashing.
 2. **Install:**
    ```
    python -m venv .venv
@@ -95,9 +121,13 @@ wrong the bet is lost right away; if it's right it waits for the top frag; a dra
    ```
    Put `DISCORD_TOKEN`, `HENRIK_API_KEY` and `GUILD_ID` in `.env` (`TRACKER_API_KEY` is an optional backup;
    `python check_tracker.py "YourName#TAG"` tests it).
-4. **Run:** `python bot.py`. To run it 24/7 on a home server (e.g. a Proxmox container), see
-   [deploy/DEPLOY.md](deploy/DEPLOY.md).
-5. In your betting channel, run `/panel` once and pin the message it posts.
+   `GUILD_ID` is your home server's ID and is required: the bot won't start without it. Don't change it later,
+   because the existing balances belong to that server.
+3. **Run:** `python bot.py`. To run it 24/7 on a home server (e.g. a Proxmox container), see
+   [deploy/DEPLOY.md](deploy/DEPLOY.md). That setup also backs up every server's database each night
+   (`valbet-backup.timer`, 14 days kept), and stops retrying after 5 crashes in 15 minutes so a bad token
+   can't log in thousands of times.
+4. In your betting channel, run `/panel` once and pin the message it posts.
 
 ## Using it
 
@@ -114,12 +144,19 @@ Nobody, including server admins, can open, close, settle or cancel a game's bets
 If a game's result never arrives (left early, remake, data source down), every bet still waiting is refunded
 after `MATCH_TIMEOUT_HOURS`. The `/panel` message is just instructions; betting happens on each **Bets open** post.
 
-Everyone who has used the bot gets 50 free coins automatically once a day (at midnight UTC, or as soon as the
-bot starts if it was offline). It happens silently, with no message in any channel.
+Everyone active in the last 14 days gets 50 free coins automatically once a day (at midnight UTC, or as soon
+as the bot starts if it was offline). It happens silently, with no message in any channel.
 
-Commands: `/panel`, `/link`, `/bet` (opens your bet slip), `/match status`, `/balance`, `/give`, `/leaderboard`, `/mybets`, `/scout Name#TAG`, `/accuracy`,
-`/unlink` (stop the bot following your games; coins are kept), and `/link-for @user Name#TAG`
-(server managers: link a friend so they don't have to).
+Commands:
+
+| Who | Commands |
+|---|---|
+| Everyone | `/info` (the full guide, plus the current game), `/link`, `/bet` (opens your bet slip), `/match status`, `/balance`, `/give`, `/leaderboard` (this server or all servers), `/mybets`, `/scout Name#TAG`, `/accuracy`, `/privacy`, `/unlink` (stops the bot following your games and deletes your game history; coins are kept) |
+| Admins (Manage Server) | `/panel` (sets the betting channel), `/public-leaderboard` (join or leave the public board), `/link-for @user Name#TAG` (link a friend) |
+| Home server only | `/overwolf-link` |
+
+Commands only work in servers, not DMs. Commands that look things up or post publicly (`/link`, `/scout`,
+`/balance`, `/give`, `/leaderboard`, `/accuracy`) can be used 3 times a minute per person.
 
 ### Automatic betting
 
@@ -129,8 +166,11 @@ Commands: `/panel`, `/link`, `/bet` (opens your bet slip), `/match status`, `/ba
     linked friends in the same Valorant party as teammates.
   - Betting closes after `AUTO_OPEN_WINDOW_SECONDS`, or as soon as the first round's result shows,
     whichever is first.
-  - When the game ends, Win/Loss bets are paid straight away from the final score. Top-frag bets need
-    the full scoreboard, so they wait for HenrikDev (or are refunded after `MATCH_TIMEOUT_HOURS`).
+  - When the game ends, Win/Loss bets are paid straight away from the final score in the home server,
+    and from HenrikDev's match record a few minutes later in other servers. Top-frag bets need the full
+    scoreboard, so they wait for HenrikDev (or are refunded after `MATCH_TIMEOUT_HOURS`).
+  - Linked friends in the host's Valorant party count as playing: they can't bet on their own team losing.
+    Linked players on the other team can't bet on that game at all.
   - Custom games, Deathmatch, Skirmish (2v2) and the Range are skipped.
   - `PRESENCE_TRACKING` (default `1`): read Valorant status; `0` turns this and auto-open off.
   - `AUTO_OPEN` (default `1`): `0` turns off automatic opening, including from the Overwolf app.
@@ -167,7 +207,9 @@ port is busy the bot still starts, just without the Overwolf connection.
   betting for better win odds. Either way, the post-game scoreboard identifies
   and scouts all opponents automatically.
 - HenrikDev usually lists a match within a minute or two of it ending. Its free key allows ~30 requests a
-  minute, shared by everything the bot does.
+  minute, shared by everything the bot does in every server. If HenrikDev says the limit is hit, every call
+  pauses until it resets. Match histories are reused for a minute, so one game open in several servers costs
+  one lookup.
 - If HenrikDev is down, the bot tries tracker.gg (if `TRACKER_API_KEY` is set), and otherwise opens betting
   with average stats. If no data source can settle a game, it's cancelled and every bet refunded after
   `MATCH_TIMEOUT_HOURS` (default 3).

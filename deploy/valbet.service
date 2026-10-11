@@ -2,6 +2,9 @@
 Description=Valorant betting Discord bot
 Wants=network-online.target
 After=network-online.target
+# A crash loop (e.g. a bad token) must not log in thousands of times a day: Discord resets the token at 1,000.
+StartLimitIntervalSec=900
+StartLimitBurst=5
 
 [Service]
 User=valbet
@@ -11,7 +14,9 @@ Environment=DASHBOARD_HOST=0.0.0.0
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/valbet/.venv/bin/python bot.py
 Restart=always
-RestartSec=10
+RestartSec=30
+# One database file per Discord server, each holding a few files open
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

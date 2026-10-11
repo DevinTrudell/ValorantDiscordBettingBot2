@@ -24,7 +24,8 @@ args = ap.parse_args()
 token = os.getenv("DASHBOARD_TOKEN")
 if not token:
     import db  # noqa: E402
-    token = db.get_meta("dashboard_token")
+    with db.use(db.HOME):
+        token = db.get_meta("dashboard_token")
 if not token:
     raise SystemExit("No key yet: start the bot once (it creates one), then run this again.")
 

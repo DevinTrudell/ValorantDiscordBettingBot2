@@ -7,6 +7,7 @@ Everything here talks to the bot through `interaction.client` (BetBot), so it ha
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -97,6 +98,7 @@ def _coins(text: str, balance: int | None = None) -> int | None:
 GREEN_EDGE, RED_EDGE = 0x23A55A, 0xF23F43
 STEPS = (500, 100, 50, 10)  # the minus buttons
 START_AMOUNT = 100          # a new slip starts here, so betting takes two clicks (the window is short)
+MIN_BET = int(os.getenv("MIN_BET", "10"))  # same setting the bot checks bets against
 T, Sep, Row = discord.ui.TextDisplay, discord.ui.Separator, discord.ui.ActionRow
 
 
@@ -145,7 +147,7 @@ def bet_icon(m, mk: dict, market: str, side: str) -> str:
 def bet_line(m, mk: dict, b) -> str:
     """'🟩 **Win** · 100 ➜ **202** · ×2.02'"""
     return (f"{bet_icon(m, mk, b['market'], b['side'])} **{odds.bet_label(mk, m['host_riot'], b['market'], b['side'])}**"
-            f" · {b['amount']:,} ➜ **{int(b['amount'] * b['odds']):,}** · ×{b['odds']:.2f}")
+            f" · {b['amount']:,} ➜ **{db.payout_of(b['amount'], b['odds']):,}** · ×{b['odds']:.2f}")
 
 
 def my_bets(match_id: int, user_id: int) -> list:
@@ -253,7 +255,7 @@ class AmountView(Card):
         super().__init__(match_id, user_id)
         self.market, self.side = market, side
         bal = self.balance()
-        self.amount = min(START_AMOUNT, bal) if bal >= 10 else 0
+        self.amount = min(START_AMOUNT, bal) if bal >= MIN_BET else 0
         self._placing = False
         self.build()
 
@@ -275,7 +277,11 @@ class AmountView(Card):
         icon = bet_icon(m, mk, self.market, self.side)
         if price is None:
             return [T("### That option isn't available any more\n-# The lineup changed. Pick again from the post.")]
-        lines = [f"# {self.amount:,}  ➜  {int(self.amount * price):,}",
+        if bal < MIN_BET:  # below the minimum bet: nothing to adjust, just a dead button
+            return [T(f"### {icon} {odds.bet_label(mk, m['host_riot'], self.market, self.side)} · ×{price:.2f}"),
+                    Sep(), T(f"You have **{bal:,}** coins, under the {MIN_BET}-coin minimum.\n-# Your daily {db.DAILY_AMOUNT:,} coins top you up."),
+                    Row(_b("💸 Broke ass", ButtonStyle.danger, disabled=True), self.start_over_button())]
+        lines = [f"# {self.amount:,}  ➜  {db.payout_of(self.amount, price):,}",
                  f"-# bet ➜ pays if right · balance **{bal:,}** · closes {_ts(m['lock_at'])}"]
         if self.amount > bal:
             lines.append(f"⚠️ That's more than your {bal:,} coins.")
@@ -437,7 +443,7 @@ class MyBetsView(Card):
         if not bets:
             return [T("### No bets on this game\n-# Pick Win or Loss on the post to bet.")]
         staked = sum(b["amount"] for b in bets)
-        best = sum(int(b["amount"] * b["odds"]) for b in bets)
+        best = sum(db.payout_of(b["amount"], b["odds"]) for b in bets)
         out = [T(f"### {self.title}\n" + "\n".join(bet_line(m, mk, b) for b in bets)
                  + (f"\n-# {self.note}" if self.note else "")), Sep(),
                T(f"Staked **{staked:,}** · best case **{best:,}**\n"
@@ -555,7 +561,7 @@ class QuickBetModal(discord.ui.Modal):
         await inter.response.send_message(embed=discord.Embed(
             title="✅ Bet placed",
             description=f"**{odds.bet_label(mk, m['host_riot'], b['market'], b['side'])}** · {b['amount']:,} at "
-                        f"×{b['odds']:.2f} → pays **{int(b['amount'] * b['odds']):,}**\n\nBalance **{balance:,}**",
+                        f"×{b['odds']:.2f} → pays **{db.payout_of(b['amount'], b['odds']):,}**\n\nBalance **{balance:,}**",
             color=0x2ECC71), ephemeral=True)
         await inter.client.announce_bets(inter.user, m, placed, balance)
 
@@ -727,7 +733,7 @@ class SlipView(discord.ui.View):
             return await inter.response.edit_message(embed=self.embed(), view=self)
         m, mk = self.match(), self.markets()
         lines = [f"**{odds.bet_label(mk, m['host_riot'], b['market'], b['side'])}** · {b['amount']:,} at "
-                 f"×{b['odds']:.2f} → pays **{int(b['amount'] * b['odds']):,}**" for b in placed]
+                 f"×{b['odds']:.2f} → pays **{db.payout_of(b['amount'], b['odds']):,}**" for b in placed]
         done = discord.Embed(title="✅ Bets placed", description="\n".join(lines) + f"\n\nBalance **{balance:,}**",
                              color=0x2ECC71)
         self.stop()
@@ -738,7 +744,7 @@ class SlipView(discord.ui.View):
 # One group bet per betting page. While someone is setting it up, nobody else can start one:
 # match_id -> (user_id, name, expires). The hold ends when they place it, close it, or after GROUP_HOLD.
 GROUP_HOLD = 120
-_group_setup: dict[int, tuple[int, str, datetime]] = {}
+_group_setup: dict[tuple[int, int], tuple[int, str, datetime]] = {}  # (server, match_id): match IDs repeat across servers
 
 
 def group_pool_side(match_id: int) -> str | None:
@@ -747,9 +753,9 @@ def group_pool_side(match_id: int) -> str | None:
 
 
 def _release_group(match_id: int, user_id: int):
-    held = _group_setup.get(match_id)
+    held = _group_setup.get((db.current_guild(), match_id))
     if held and held[0] == user_id:
-        _group_setup.pop(match_id, None)
+        _group_setup.pop((db.current_guild(), match_id), None)
 
 
 class GroupSlipView(Card):
@@ -762,7 +768,7 @@ class GroupSlipView(Card):
         self.win: str | None = None
         self.tf: str | None = None
         bal = self.balance()
-        self.amount = min(START_AMOUNT, bal) if bal >= 10 else 0
+        self.amount = min(START_AMOUNT, bal) if bal >= MIN_BET else 0
         self._placing = False
         self.joining = group_pool_side(match_id)
         self.confirming = False  # Create/Join asks "are you sure?" first, so it can't be hit by accident
@@ -841,7 +847,7 @@ class GroupSlipView(Card):
             win_odds = mk["win"][self.win]
             tf_odds = next(o["odds"] for o in mk["topfrag"] if o["riot"] == self.tf)
             nt = db.next_tier(after)
-            coins += [f"# {self.amount:,}  ➜  {int(self.amount * price * (1 + bonus / 100)):,}",
+            coins += [f"# {self.amount:,}  ➜  {db.payout_of(self.amount, price, bonus):,}",
                       f"-# ×{win_odds:.2f} × ×{tf_odds:.2f} = **×{price:.2f}**"
                       + (f" · +{bonus}% pool bonus" if bonus else ""),
                       f"🪙 Pool **{pool['total']:,}** ➜ **{after:,}** with you · {people} "
@@ -913,12 +919,12 @@ async def open_group_slip(inter: discord.Interaction, m):
         return await inter.response.send_message("Group bets need a top-frag pick, which this game doesn't have.",
                                                  ephemeral=True)
     if not group_pool_side(m["id"]):  # nobody has created it yet: only one person can be setting it up
-        held = _group_setup.get(m["id"])
+        held = _group_setup.get((db.current_guild(), m["id"]))
         if held and held[0] != inter.user.id and _now() < held[2]:
             return await inter.response.send_message(
                 f"🔒 **{held[1]}** is setting up this game's group bet right now. Once it's created, the post's button "
                 "changes to **👥 Join group bet** if you'd like to join (optional).", ephemeral=True)
-        _group_setup[m["id"]] = (inter.user.id, getattr(inter.user, "display_name", "Someone"),
+        _group_setup[db.current_guild(), m["id"]] = (inter.user.id, getattr(inter.user, "display_name", "Someone"),
                                  _now() + timedelta(seconds=GROUP_HOLD))
     await inter.response.send_message(view=GroupSlipView(m["id"], inter.user.id), ephemeral=True)
 

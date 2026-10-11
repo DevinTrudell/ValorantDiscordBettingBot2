@@ -17,10 +17,13 @@ id valbet >/dev/null 2>&1 || useradd --system --home "$DEST" --shell /usr/sbin/n
 mkdir -p "$DEST"
 
 if [ "$SRC" != "$DEST" ]; then
-  # Copy the code; never overwrite the server's own .env or database if they already exist there.
+  # Copy the code; never overwrite the server's own .env or data if they already exist there (one database
+  # file per Discord server: valbet.db, valbet-<server id>.db, each with -wal/-shm). Stop first: copying over
+  # a live SQLite file corrupts it.
+  systemctl stop valbet 2>/dev/null || true
   rsync -a --exclude .venv --exclude __pycache__ --exclude '*.tar.gz' \
         $( [ -f "$DEST/.env" ] && echo --exclude .env ) \
-        $( [ -f "$DEST/valbet.db" ] && echo "--exclude valbet.db --exclude valbet.db-wal --exclude valbet.db-shm" ) \
+        $( [ -f "$DEST/valbet.db" ] && echo "--exclude=*.db --exclude=*.db-wal --exclude=*.db-shm --exclude=presence_log.jsonl --exclude=riot_session.json" ) \
         "$SRC"/ "$DEST"/
 fi
 

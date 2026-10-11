@@ -25,7 +25,8 @@ import ha_bridge
 log = logging.getLogger("valbet.overwolf")
 HOST = os.getenv("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("DASHBOARD_PORT", "8787"))
-TOKEN = os.getenv("DASHBOARD_TOKEN") or db.get_or_create_meta("dashboard_token", lambda: secrets.token_urlsafe(18))
+with db.use(db.HOME):  # one bot-wide key, kept in the home server's file
+    TOKEN = os.getenv("DASHBOARD_TOKEN") or db.get_or_create_meta("dashboard_token", lambda: secrets.token_urlsafe(18))
 _HA_SEEN: dict[str, float] = {}  # sender -> when we last logged a batch from them
 
 

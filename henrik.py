@@ -12,6 +12,7 @@ There's no live data: betting still opens from Discord status.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import ssl
@@ -118,6 +119,8 @@ class HenrikClient:
         self._session: aiohttp.ClientSession | None = None
         self._regions: dict[str, str] = {}
         self._gate = asyncio.Semaphore(2)
+        self._paused_until = 0.0  # after a 429, every call waits this out (one key is shared by all servers)
+        self._recent: dict[tuple[str, int], tuple[float, list]] = {}  # (riot_id, size) -> (when, details)
 
     @property
     def enabled(self) -> bool:
@@ -131,6 +134,8 @@ class HenrikClient:
             self._session = aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ctx),
                                                   timeout=aiohttp.ClientTimeout(total=40),
                                                   headers={"Authorization": self.key})
+        if time.time() < self._paused_until:
+            raise HenrikError("HenrikDev rate limit reached; try again in a minute")
         async with self._gate:
             try:
                 async with self._session.get(BASE + path) as r:
@@ -140,6 +145,13 @@ class HenrikClient:
                     if r.status == 404:
                         raise HenrikError("player or match not found on HenrikDev")
                     if r.status == 429:
+                        wait = r.headers.get("Retry-After") or r.headers.get("x-ratelimit-reset") or "60"
+                        try:
+                            wait = min(max(float(wait), 5.0), 300.0)
+                        except ValueError:
+                            wait = 60.0
+                        self._paused_until = time.time() + wait
+                        log.warning("HenrikDev rate limit: pausing all calls for %.0fs", wait)
                         raise HenrikError("HenrikDev rate limit reached; try again in a minute")
                     if r.status >= 400:
                         raise HenrikError(f"HenrikDev error (HTTP {r.status})")
@@ -156,12 +168,19 @@ class HenrikClient:
         return self._regions[key]
 
     async def recent_details(self, riot_id: str, size: int = 5) -> list[MatchDetail]:
-        """Their latest finished matches, newest first, with full scoreboards."""
+        """Their latest finished matches, newest first, with full scoreboards. Reused for a minute, so one
+        game opening in several servers costs one lookup."""
+        key = (riot_id.casefold(), size)
+        hit = self._recent.get(key)
+        if hit and time.time() - hit[0] < 60:
+            return copy.deepcopy(hit[1])  # callers edit scoreboards (ranks, hidden names): never share them
         name, _, tag = riot_id.partition("#")
         region = await self.region(riot_id)
         data = await self._get(f"/valorant/v4/matches/{region}/pc/{quote(name)}/{quote(tag)}?size={size}")
-        out = [to_detail(m) for m in data.get("data") or []]
-        return [d for d in out if d]
+        out = [d for d in (to_detail(m) for m in data.get("data") or []) if d]
+        self._recent = {k: v for k, v in self._recent.items() if time.time() - v[0] < 60}  # keep it small
+        self._recent[key] = (time.time(), out)
+        return copy.deepcopy(out)
 
     async def summary(self, riot_id: str, region: str | None = None) -> dict | None:
         """Their current Competitive rank plus this season's wins/games:
@@ -174,7 +193,7 @@ class HenrikClient:
             return hit[0]
         name, _, tag = riot_id.partition("#")
         try:
-            region = region or next(iter(self._regions.values()), None) or await self.region(riot_id)
+            region = region or await self.region(riot_id)
             data = (await self._get(f"/valorant/v3/mmr/{region}/pc/{quote(name)}/{quote(tag)}")).get("data") or {}
         except HenrikError as e:
             log.info("No current rank for %s: %s", riot_id, e)
@@ -204,7 +223,9 @@ class HenrikClient:
         missing = [p for p in detail.players if (p.rank or "").lower() in ("unrated", "unranked", "")]
         if not missing:
             return
-        region = next(iter(self._regions.values()), None)  # everyone in a match shares a region
+        # Everyone in a match shares a region: use any player whose region is already known.
+        region = next((self._regions[p.riot_id.casefold()] for p in detail.players
+                       if p.riot_id.casefold() in self._regions), None)
         ranks = []
         for i, p in enumerate(missing):  # one at a time, spaced out: kinder to the free key's rate limit
             try:

@@ -1,0 +1,6 @@
+[Unit]
+Description=Back up the Valorant betting bot's databases
+
+[Service]
+Type=oneshot
+ExecStart=/opt/valbet/.venv/bin/python /opt/valbet/deploy/backup.py /opt/valbet /var/backups/valbet
